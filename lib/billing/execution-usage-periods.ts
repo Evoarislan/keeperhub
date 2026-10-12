@@ -1,6 +1,6 @@
 import "server-only";
 
-import { and, eq, gt, gte, inArray, lt, lte, min, sql } from "drizzle-orm";
+import { and, eq, gt, gte, inArray, lt, lte, sql } from "drizzle-orm";
 import { db } from "@/lib/db";
 import {
   type ExecutionUsagePeriodSource,
@@ -354,28 +354,25 @@ export function resolvePeriodSource(
  * overage today, but did not during those days, so a month row with no charge
  * is accurate rather than contradictory.
  *
- * `covered` is clipped to the span the close is looking at, so on its own it
- * cannot answer this: an organization whose only recorded cycle ended before
- * the span would look as if it had never converted, and every month in the
- * span would read as pre-conversion. `earliestRecordedCycleStart` is the
- * earliest cycle on record with no lower bound, from
- * `getEarliestRecordedCycleStarts`, and is what anchors the answer. `covered`
- * still contributes the live period, which is not a record.
+ * "Every cycle" means every cycle inside the span `covered` was read for, and
+ * deliberately not every cycle on record. The records cannot tell a gap the
+ * organization spent on the free plan from a gap of paid cycles nothing
+ * recorded, so anchoring on the oldest cycle in all of history reads every gap
+ * as paid: an organization that paid once, left, and subscribed again a year
+ * later would lose the free-plan days before its new cycle, and nothing else
+ * writes those. A cycle missing from the records is fixed by recording it.
  */
 export function predatesProviderCycles(
   window: PeriodWindow,
-  covered: CoveredInterval[],
-  earliestRecordedCycleStart?: Date
+  covered: CoveredInterval[]
 ): boolean {
-  let earliest = earliestRecordedCycleStart;
-  for (const interval of covered) {
-    if (earliest === undefined || interval.start < earliest) {
-      earliest = interval.start;
-    }
-  }
-  if (earliest === undefined) {
+  if (covered.length === 0) {
     return false;
   }
+  const earliest = covered.reduce(
+    (min, c) => (c.start < min ? c.start : min),
+    covered[0].start
+  );
   return window.periodEnd <= earliest;
 }
 
@@ -399,15 +396,25 @@ export type CoveredInterval = { start: Date; end: Date };
  *
  * So coverage decides, month by month. Returns null when the cycle covers the
  * window completely.
+ *
+ * The intervals are walked in start order, whatever order they arrive in. The
+ * trim below is only right that way round: taken later-cycle-first, two
+ * adjacent cycles close the window from the right and then cover what is left
+ * of it, and the uncovered days after the second cycle are reported as covered.
+ * `getProviderCoverage` concatenates three unordered reads, so the caller
+ * cannot be relied on for it.
  */
 export function uncoveredPart(
   windowStart: Date,
   windowEnd: Date,
   covered: CoveredInterval[]
 ): PeriodWindow | null {
+  const ordered = [...covered].sort(
+    (a, b) => a.start.getTime() - b.start.getTime()
+  );
   let start = windowStart;
   let end = windowEnd;
-  for (const interval of covered) {
+  for (const interval of ordered) {
     if (interval.end <= start || interval.start >= end) {
       continue;
     }
@@ -424,6 +431,78 @@ export function uncoveredPart(
     }
   }
   return start < end ? { periodStart: start, periodEnd: end } : null;
+}
+
+/**
+ * The part of a calendar window a `calendar_month` row may be written for, or
+ * null when the window is not this path's to record.
+ *
+ * One function, because two callers have to reach the same answer: the month
+ * close, and the repair that rewrites a row an earlier close got wrong. A
+ * repair deciding this for itself would write rows the close never would.
+ */
+export function calendarWindowToRecord(
+  windowStart: Date,
+  windowEnd: Date,
+  covered: CoveredInterval[],
+  sub: SubscriptionPlanRow | undefined
+): PeriodWindow | null {
+  const window = uncoveredPart(windowStart, windowEnd, covered);
+  // Fully covered by a provider cycle: that cycle's own record is the one
+  // that counts, and a month row beside it would double count.
+  if (window === null) {
+    return null;
+  }
+  // Coverage says nobody billed this window. The plan still decides whether
+  // a zero-charge month row is an honest thing to write for it: a plan that
+  // bills overage settles through its cycle, so a month row beside a stalled
+  // or dunning cycle would carry the paid limit and a charge of zero. The
+  // exception is a window predating every cycle the organization has, which
+  // is the part of a conversion month before it started paying.
+  if (
+    sub !== undefined &&
+    billsOverage(sub.plan) &&
+    !predatesProviderCycles(window, covered)
+  ) {
+    return null;
+  }
+  return window;
+}
+
+/**
+ * The `calendar_month` row for a window nothing billed.
+ *
+ * Best effort on the plan, and knowingly so: nothing stores what plan an
+ * organization was on during a month that has already closed, so a
+ * reconstructed row carries today's plan. Coverage is exact; this is not, and
+ * the invoices page prefers a billed record where one exists.
+ */
+export function calendarUsageRow(
+  organizationId: string,
+  window: PeriodWindow,
+  counts: PeriodExecutionCounts,
+  sub: SubscriptionPlanRow | undefined
+): typeof executionUsagePeriods.$inferInsert {
+  const snapshot = planSnapshotFrom(sub);
+  return {
+    organizationId,
+    periodStart: window.periodStart,
+    periodEnd: window.periodEnd,
+    plan: snapshot.plan,
+    tier: snapshot.tier,
+    executionLimit: snapshot.executionLimit,
+    workflowExecutions: counts.workflowExecutions,
+    directExecutions: counts.directExecutions,
+    totalExecutions: counts.total,
+    overageCount:
+      snapshot.executionLimit === -1
+        ? 0
+        : Math.max(0, counts.total - snapshot.executionLimit),
+    // No charge reaches this path: anything a provider cycle billed is
+    // covered and excluded, so what remains was never invoiced.
+    totalChargeCents: 0,
+    source: "calendar_month",
+  };
 }
 
 /** First instant of the UTC month before the one `now` falls in. */
@@ -749,70 +828,6 @@ export async function getProviderCoverage(
   return coverage;
 }
 
-/**
- * The start of the earliest provider cycle on record for each organization,
- * with no lower bound on how far back it looks.
- *
- * Kept apart from `getProviderCoverage` on purpose. Coverage answers which
- * part of a month a cycle already accounts for, so clipping it to the span is
- * right: a cycle outside the span cannot overlap a month inside it. Whether an
- * organization had started paying by a given month is a different question,
- * and the cycle that answers it can be arbitrarily old. An organization billed
- * an overage once, long ago, that has stayed inside its limit since has no
- * record inside any recent span at all.
- *
- * Both sources are records of a cycle that really ran: a charge raised for it,
- * or its usage frozen when it closed. The live period columns are not read
- * here. They are not history, and a churned organization keeps a stale pair
- * forever; `getProviderCoverage` already contributes them where they fall
- * inside the span.
- *
- * An organization absent from the result has no cycle on record.
- */
-export async function getEarliestRecordedCycleStarts(
-  organizationIds: string[]
-): Promise<Map<string, Date>> {
-  if (organizationIds.length === 0) {
-    return new Map();
-  }
-
-  const [billed, recorded] = await Promise.all([
-    db
-      .select({
-        organizationId: overageBillingRecords.organizationId,
-        earliest: min(overageBillingRecords.periodStart),
-      })
-      .from(overageBillingRecords)
-      .where(inArray(overageBillingRecords.organizationId, organizationIds))
-      .groupBy(overageBillingRecords.organizationId),
-    db
-      .select({
-        organizationId: executionUsagePeriods.organizationId,
-        earliest: min(executionUsagePeriods.periodStart),
-      })
-      .from(executionUsagePeriods)
-      .where(
-        and(
-          inArray(executionUsagePeriods.organizationId, organizationIds),
-          eq(executionUsagePeriods.source, "subscription")
-        )
-      )
-      .groupBy(executionUsagePeriods.organizationId),
-  ]);
-
-  const earliest = new Map<string, Date>();
-  for (const row of [...billed, ...recorded]) {
-    if (row.earliest === null) {
-      continue;
-    }
-    const known = earliest.get(row.organizationId);
-    if (known === undefined || row.earliest < known) {
-      earliest.set(row.organizationId, row.earliest);
-    }
-  }
-  return earliest;
-}
-
 export type StoredPeriodUsage = {
   periodStart: Date;
   periodEnd: Date;
@@ -936,13 +951,11 @@ export async function closeCalendarMonthUsage(
   }
 
   const organizationIds = [...new Set(usage.map((row) => row.organizationId))];
-  const [subscriptions, coverage, earliestCycleStarts, recordedKeys] =
-    await Promise.all([
-      getSubscriptionsByOrg(organizationIds),
-      getProviderCoverage(organizationIds, spanStart, spanEnd),
-      getEarliestRecordedCycleStarts(organizationIds),
-      getRecordedPeriodKeys(organizationIds, spanStart, spanEnd),
-    ]);
+  const [subscriptions, coverage, recordedKeys] = await Promise.all([
+    getSubscriptionsByOrg(organizationIds),
+    getProviderCoverage(organizationIds, spanStart, spanEnd),
+    getRecordedPeriodKeys(organizationIds, spanStart, spanEnd),
+  ]);
 
   const values: PendingUsageRow[] = [];
   let considered = 0;
@@ -951,35 +964,14 @@ export async function closeCalendarMonthUsage(
   for (const row of usage) {
     const monthStart = row.monthStart;
     const monthEnd = addMonthsUtc(monthStart, 1);
-    const window = uncoveredPart(
+    const sub = subscriptions.get(row.organizationId);
+    const window = calendarWindowToRecord(
       monthStart,
       monthEnd,
-      coverage.get(row.organizationId) ?? []
+      coverage.get(row.organizationId) ?? [],
+      sub
     );
-    // Fully covered by a provider cycle: that cycle's own record is the one
-    // that counts, and a month row beside it would double count.
     if (window === null) {
-      continue;
-    }
-    // Coverage says nobody billed this window. The plan still decides whether
-    // a zero-charge month row is an honest thing to write for it: a plan that
-    // bills overage settles through its cycle, so a month row beside a stalled
-    // or dunning cycle would carry the paid limit and a charge of zero. The
-    // exception is a window predating every cycle the organization has, which
-    // is the part of a conversion month before it started paying. That is
-    // judged against the earliest cycle on record however old it is, not only
-    // the ones inside this span.
-    const sub = subscriptions.get(row.organizationId);
-    const covers = coverage.get(row.organizationId) ?? [];
-    if (
-      sub !== undefined &&
-      billsOverage(sub.plan) &&
-      !predatesProviderCycles(
-        window,
-        covers,
-        earliestCycleStarts.get(row.organizationId)
-      )
-    ) {
       continue;
     }
     considered += 1;
@@ -1009,30 +1001,7 @@ export async function closeCalendarMonthUsage(
       continue;
     }
 
-    const snapshot = planSnapshotFrom(subscriptions.get(row.organizationId));
-    values.push({
-      organizationId: row.organizationId,
-      periodStart: window.periodStart,
-      periodEnd: window.periodEnd,
-      // Best effort, and knowingly so: nothing stores what plan an
-      // organization was on during a month that has already closed, so a
-      // reconstructed row carries today's plan. Coverage above is exact; this
-      // is not, and the invoices page prefers a billed record where one exists.
-      plan: snapshot.plan,
-      tier: snapshot.tier,
-      executionLimit: snapshot.executionLimit,
-      workflowExecutions: counts.workflowExecutions,
-      directExecutions: counts.directExecutions,
-      totalExecutions: counts.total,
-      overageCount:
-        snapshot.executionLimit === -1
-          ? 0
-          : Math.max(0, counts.total - snapshot.executionLimit),
-      // No charge reaches this path: anything a provider cycle billed is
-      // covered above and excluded, so what remains was never invoiced.
-      totalChargeCents: 0,
-      source: "calendar_month" as const,
-    });
+    values.push(calendarUsageRow(row.organizationId, window, counts, sub));
   }
 
   if (values.length === 0) {

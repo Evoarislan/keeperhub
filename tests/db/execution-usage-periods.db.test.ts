@@ -146,6 +146,11 @@ async function storedRows() {
     .where(eq(executionUsagePeriods.organizationId, ORG));
 }
 
+/** In a fixed order, so two reads of the table can be compared whole. */
+async function storedRowsById() {
+  return (await storedRows()).sort((a, b) => a.id.localeCompare(b.id));
+}
+
 async function cleanup(): Promise<void> {
   for (const org of [ORG, ORG_NOSUB]) {
     await testDb
@@ -191,6 +196,59 @@ afterAll(async () => {
   await testDb.delete(users).where(eq(users.id, USER));
   await queryClient.end();
 });
+
+/** A provider cycle the billing path raised a charge for. */
+async function addOverageRecord(
+  periodStart: Date,
+  periodEnd: Date,
+  status = "billed"
+): Promise<void> {
+  await testDb.insert(overageBillingRecords).values({
+    id: `${PREFIX}overage`,
+    organizationId: ORG,
+    periodStart,
+    periodEnd,
+    executionLimit: 25_000,
+    totalExecutions: 30_000,
+    overageCount: 5000,
+    overageRateCents: 200,
+    totalChargeCents: 1000,
+    status,
+  });
+}
+
+/** A usage row as one of the writers would have left it. */
+async function addUsageRow(
+  id: string,
+  periodStart: Date,
+  periodEnd: Date,
+  source: "subscription" | "calendar_month",
+  totalExecutions = 5
+): Promise<void> {
+  await testDb.insert(executionUsagePeriods).values({
+    id: `${PREFIX}${id}`,
+    organizationId: ORG,
+    periodStart,
+    periodEnd,
+    plan: "pro",
+    tier: "25k",
+    executionLimit: 25_000,
+    workflowExecutions: totalExecutions,
+    directExecutions: 0,
+    totalExecutions,
+    overageCount: 0,
+    totalChargeCents: 0,
+    source,
+  });
+}
+
+function overlapping(
+  rows: Awaited<ReturnType<typeof storedRows>>,
+  start: Date,
+  end: Date
+): Awaited<ReturnType<typeof storedRows>> {
+  return rows.filter((r) => r.periodStart < end && start < r.periodEnd);
+}
 
 /** After the period has closed, so the recorder accepts it. */
 const AFTER_CLOSE = new Date(Date.UTC(2026, 1, 2));
@@ -800,34 +858,6 @@ describe("execution usage periods (real database)", () => {
       expect(starts).toContain(PERIOD_START.toISOString());
     });
 
-    /** A provider cycle the billing path raised a charge for. */
-    async function addOverageRecord(
-      periodStart: Date,
-      periodEnd: Date,
-      status = "billed"
-    ): Promise<void> {
-      await testDb.insert(overageBillingRecords).values({
-        id: `${PREFIX}overage`,
-        organizationId: ORG,
-        periodStart,
-        periodEnd,
-        executionLimit: 25_000,
-        totalExecutions: 30_000,
-        overageCount: 5000,
-        overageRateCents: 200,
-        totalChargeCents: 1000,
-        status,
-      });
-    }
-
-    function overlapping(
-      rows: Awaited<ReturnType<typeof storedRows>>,
-      start: Date,
-      end: Date
-    ): Awaited<ReturnType<typeof storedRows>> {
-      return rows.filter((r) => r.periodStart < end && start < r.periodEnd);
-    }
-
     it.each(["billed", "pending", "failed"])(
       "stays out of a cycle held only by a %s overage record",
       async (status) => {
@@ -911,71 +941,365 @@ describe("execution usage periods (real database)", () => {
       expect(rows[0]?.totalExecutions).toBe(1);
     });
 
-    /** Runs in every month of the span, all before the live cycle starts. */
-    async function addRunsAcrossSpanBeforeLiveCycle(): Promise<void> {
+    it.each([
+      [
+        "an overage record",
+        (start: Date, end: Date) => addOverageRecord(start, end),
+      ],
+      [
+        "a subscription row",
+        (start: Date, end: Date) =>
+          addUsageRow("old_cycle", start, end, "subscription"),
+      ],
+    ])(
+      "records the days before a new live cycle when the last one, known from %s, is long past",
+      async (_source, addOldCycle) => {
+        // Paid in 2025, left, and subscribed again partway through a month in
+        // the span. The old cycle says nothing about the gap after it: the
+        // organization spent it on the free plan. Taking that cycle as the
+        // start of paying would drop the days before the new one, and nothing
+        // else writes them.
+        await addOldCycle(
+          new Date(Date.UTC(2025, 7, 6)),
+          new Date(Date.UTC(2025, 8, 6))
+        );
+        const liveStart = new Date(Date.UTC(2026, 0, 6));
+        await testDb
+          .update(organizationSubscriptions)
+          .set({
+            plan: "pro",
+            tier: "25k",
+            status: "active",
+            currentPeriodStart: liveStart,
+            currentPeriodEnd: new Date(Date.UTC(2026, 1, 6)),
+          })
+          .where(eq(organizationSubscriptions.organizationId, ORG));
+        await addRun("before_live", new Date(Date.UTC(2026, 0, 3)));
+        await addRun("in_live", new Date(Date.UTC(2026, 0, 20)));
+
+        const { closeCalendarMonthUsage } = await import(
+          "../../lib/billing/execution-usage-periods"
+        );
+        await closeCalendarMonthUsage(AFTER_MONTH);
+
+        const calendar = (await storedRows()).filter(
+          (r) => r.source === "calendar_month"
+        );
+        expect(calendar).toHaveLength(1);
+        expect(calendar[0]?.periodStart.toISOString()).toBe(
+          PERIOD_START.toISOString()
+        );
+        expect(calendar[0]?.periodEnd.toISOString()).toBe(
+          liveStart.toISOString()
+        );
+        expect(calendar[0]?.totalExecutions).toBe(1);
+      }
+    );
+
+    it("finds the uncovered days after two adjacent cycles read later-first", async () => {
+      // Coverage is three reads joined end to end, so the later cycle can come
+      // first: here it is a recorded row, and the earlier one is an overage
+      // record, which is read last. Walked in that order the month used to
+      // read as fully covered and the days after the second cycle were lost.
+      const boundary = new Date(Date.UTC(2025, 11, 10));
+      const laterEnd = new Date(Date.UTC(2025, 11, 20));
+      await addOverageRecord(new Date(Date.UTC(2025, 10, 10)), boundary);
+      await addUsageRow("later_cycle", boundary, laterEnd, "subscription");
       await testDb
         .update(organizationSubscriptions)
         .set({
-          plan: "pro",
-          tier: "25k",
-          status: "active",
-          currentPeriodStart: new Date(Date.UTC(2026, 0, 6)),
-          currentPeriodEnd: new Date(Date.UTC(2026, 1, 6)),
+          plan: "free",
+          tier: null,
+          status: "canceled",
+          currentPeriodStart: null,
+          currentPeriodEnd: null,
         })
         .where(eq(organizationSubscriptions.organizationId, ORG));
-      await addRun("span_nov", new Date(Date.UTC(2025, 10, 20)));
-      await addRun("span_dec", new Date(Date.UTC(2025, 11, 20)));
-      await addRun("span_jan", new Date(Date.UTC(2026, 0, 3)));
+      await addRun("in_later_cycle", new Date(Date.UTC(2025, 11, 15)));
+      await addRun("after_cycles", new Date(Date.UTC(2025, 11, 25)));
+
+      const { closeCalendarMonthUsage } = await import(
+        "../../lib/billing/execution-usage-periods"
+      );
+      await closeCalendarMonthUsage(AFTER_MONTH);
+
+      const calendar = (await storedRows()).filter(
+        (r) => r.source === "calendar_month"
+      );
+      expect(calendar).toHaveLength(1);
+      expect(calendar[0]?.periodStart.toISOString()).toBe(
+        laterEnd.toISOString()
+      );
+      expect(calendar[0]?.periodEnd.toISOString()).toBe(
+        PERIOD_START.toISOString()
+      );
+      expect(calendar[0]?.totalExecutions).toBe(1);
+    });
+  });
+
+  describe("repairCalendarRowsOverBilledCycles", () => {
+    // Deliberately far older than CALENDAR_CLOSE_LOOKBACK_MONTHS from any date
+    // the close is run with in this file, so nothing here can be put right by
+    // the close itself.
+    const CYCLE_START = new Date(Date.UTC(2025, 5, 10));
+    const CYCLE_END = new Date(Date.UTC(2025, 6, 10));
+    const JUNE = new Date(Date.UTC(2025, 5, 1));
+    const JULY = new Date(Date.UTC(2025, 6, 1));
+    const AUGUST = new Date(Date.UTC(2025, 7, 1));
+
+    async function setPlan(plan: "pro" | "free"): Promise<void> {
+      await testDb
+        .update(organizationSubscriptions)
+        .set({
+          plan,
+          tier: plan === "pro" ? "25k" : null,
+          status: plan === "pro" ? "active" : "canceled",
+          currentPeriodStart: null,
+          currentPeriodEnd: null,
+        })
+        .where(eq(organizationSubscriptions.organizationId, ORG));
     }
 
-    it("reads a cycle billed before the lookback as the start of paying", async () => {
-      // Billed an overage once, then inside the limit ever since, so no later
-      // cycle left a record. The one that did ended before the span begins,
-      // and a close that only sees the span takes the live cycle for the
-      // first one: every month before it then reads as pre-conversion and gets
-      // a row at the paid limit with a charge of zero.
-      const spanStart = new Date(Date.UTC(2025, 10, 1));
-      const billedEnd = new Date(Date.UTC(2025, 8, 6));
-      expect(billedEnd < spanStart).toBe(true);
-      await addOverageRecord(new Date(Date.UTC(2025, 7, 6)), billedEnd);
-      await addRunsAcrossSpanBeforeLiveCycle();
+    /**
+     * The shape the old close left behind: a billed cycle from Jun 10 to
+     * Jul 10 with a whole-month row written across each side of it.
+     */
+    async function seedRowsAcrossBilledCycle(): Promise<void> {
+      await addOverageRecord(CYCLE_START, CYCLE_END);
+      await addUsageRow("june", JUNE, JULY, "calendar_month", 2);
+      await addUsageRow("july", JULY, AUGUST, "calendar_month", 2);
+      await addRun("before_cycle", new Date(Date.UTC(2025, 5, 5)));
+      await addRun("in_cycle_june", new Date(Date.UTC(2025, 5, 20)));
+      await addRun("in_cycle_july", new Date(Date.UTC(2025, 6, 5)));
+      await addRun("after_cycle", new Date(Date.UTC(2025, 6, 20)));
+    }
 
-      const { closeCalendarMonthUsage } = await import(
-        "../../lib/billing/execution-usage-periods"
+    async function repair(dryRun = false) {
+      const { repairCalendarRowsOverBilledCycles } = await import(
+        "../../lib/billing/execution-usage-period-repair"
       );
-      await closeCalendarMonthUsage(AFTER_MONTH);
-
-      expect(await storedRows()).toHaveLength(0);
-    });
-
-    it("reads a cycle recorded before the lookback as the start of paying", async () => {
-      // The same shape, with the old cycle known from its usage record rather
-      // than from a charge.
-      await testDb.insert(executionUsagePeriods).values({
-        id: `${PREFIX}old_sub_row`,
+      return await repairCalendarRowsOverBilledCycles({
         organizationId: ORG,
-        periodStart: new Date(Date.UTC(2025, 7, 6)),
-        periodEnd: new Date(Date.UTC(2025, 8, 6)),
-        plan: "pro",
-        tier: "25k",
-        executionLimit: 25_000,
-        workflowExecutions: 5,
-        directExecutions: 0,
-        totalExecutions: 5,
-        overageCount: 0,
-        totalChargeCents: 0,
-        source: "subscription",
+        dryRun,
       });
-      await addRunsAcrossSpanBeforeLiveCycle();
+    }
 
-      const { closeCalendarMonthUsage } = await import(
-        "../../lib/billing/execution-usage-periods"
-      );
-      await closeCalendarMonthUsage(AFTER_MONTH);
+    it.each([
+      ["billed", 1000],
+      ["pending", 0],
+      ["failed", 0],
+    ])(
+      "records a cycle held only by a %s overage record from its frozen figures",
+      async (status, expectedChargeCents) => {
+        await setPlan("pro");
+        await addOverageRecord(CYCLE_START, CYCLE_END, status);
+        await addRun("in_cycle", new Date(Date.UTC(2025, 5, 20)));
+
+        const summary = await repair();
+
+        expect(summary.cyclesRecorded).toHaveLength(1);
+        const rows = await storedRows();
+        expect(rows).toHaveLength(1);
+        expect(rows[0]?.source).toBe("subscription");
+        expect(rows[0]?.periodStart.toISOString()).toBe(
+          CYCLE_START.toISOString()
+        );
+        expect(rows[0]?.periodEnd.toISOString()).toBe(CYCLE_END.toISOString());
+        // The limit, total and overage count are the record's, not a recount:
+        // one run exists in the window and the limit is read off the record.
+        expect(rows[0]?.executionLimit).toBe(25_000);
+        expect(rows[0]?.totalExecutions).toBe(30_000);
+        expect(rows[0]?.overageCount).toBe(5000);
+        expect(rows[0]?.workflowExecutions).toBe(1);
+        // Only a record that reached `billed` raised a charge.
+        expect(rows[0]?.totalChargeCents).toBe(expectedChargeCents);
+      }
+    );
+
+    it("rewrites a row older than the close lookback down to the days before the cycle", async () => {
+      await setPlan("pro");
+      await seedRowsAcrossBilledCycle();
+
+      const summary = await repair();
 
       const rows = await storedRows();
+      const calendar = rows.filter((r) => r.source === "calendar_month");
+      expect(overlapping(calendar, CYCLE_START, CYCLE_END)).toHaveLength(0);
+      // June keeps the days before the cycle, recounted for that window. July
+      // keeps nothing: the plan bills overage and the days after the cycle do
+      // not predate it, so they are the billing path's.
+      expect(calendar).toHaveLength(1);
+      expect(calendar[0]?.periodStart.toISOString()).toBe(JUNE.toISOString());
+      expect(calendar[0]?.periodEnd.toISOString()).toBe(
+        CYCLE_START.toISOString()
+      );
+      expect(calendar[0]?.totalExecutions).toBe(1);
+      expect(calendar[0]?.totalChargeCents).toBe(0);
+      expect(rows.filter((r) => r.source === "subscription")).toHaveLength(1);
+
+      expect(summary.rowsRewritten).toHaveLength(2);
+      expect(summary.rowsRewritten[0]?.written?.periodEnd.toISOString()).toBe(
+        CYCLE_START.toISOString()
+      );
+      expect(summary.rowsRewritten[1]?.written).toBeNull();
+    });
+
+    it("also writes the days after the cycle for an organization that no longer bills overage", async () => {
+      await setPlan("free");
+      await seedRowsAcrossBilledCycle();
+
+      await repair();
+
+      const calendar = (await storedRows())
+        .filter((r) => r.source === "calendar_month")
+        .sort((a, b) => a.periodStart.getTime() - b.periodStart.getTime());
+      expect(overlapping(calendar, CYCLE_START, CYCLE_END)).toHaveLength(0);
+      expect(calendar).toHaveLength(2);
+      expect(calendar[1]?.periodStart.toISOString()).toBe(
+        CYCLE_END.toISOString()
+      );
+      expect(calendar[1]?.periodEnd.toISOString()).toBe(AUGUST.toISOString());
+      expect(calendar[1]?.totalExecutions).toBe(1);
+      expect(calendar[1]?.plan).toBe("free");
+    });
+
+    it("matches a row that crosses a cycle boundary and not one that only touches it", async () => {
+      await setPlan("pro");
+      await addOverageRecord(CYCLE_START, CYCLE_END);
+      // Both windows are half-open. These two share an instant with the cycle
+      // and no time: the first is exactly what the close writes for the days
+      // before a cycle.
+      await addUsageRow("ends_at_start", JUNE, CYCLE_START, "calendar_month");
+      await addUsageRow("starts_at_end", CYCLE_END, AUGUST, "calendar_month");
+      // One millisecond into the cycle from either side.
+      await addUsageRow(
+        "crosses_start",
+        JUNE,
+        new Date(CYCLE_START.getTime() + 1),
+        "calendar_month"
+      );
+      await addUsageRow(
+        "crosses_end",
+        new Date(CYCLE_END.getTime() - 1),
+        AUGUST,
+        "calendar_month"
+      );
+      // A recorded cycle is never a candidate, wherever it lies.
+      await addUsageRow("recorded", CYCLE_START, CYCLE_END, "subscription");
+
+      const { findCalendarRowsOverBilledCycles } = await import(
+        "../../lib/billing/execution-usage-period-repair"
+      );
+      const matched = await findCalendarRowsOverBilledCycles(ORG);
+
+      expect(matched.map((r) => r.id).sort()).toEqual([
+        `${PREFIX}crosses_end`,
+        `${PREFIX}crosses_start`,
+      ]);
+    });
+
+    it("leaves rows that only touch a cycle exactly as they are", async () => {
+      await setPlan("pro");
+      await addOverageRecord(CYCLE_START, CYCLE_END);
+      await addUsageRow("ends_at_start", JUNE, CYCLE_START, "calendar_month");
+      await addUsageRow("starts_at_end", CYCLE_END, AUGUST, "calendar_month");
+
+      const summary = await repair();
+
+      expect(summary.rowsRewritten).toHaveLength(0);
+      const calendar = (await storedRows()).filter(
+        (r) => r.source === "calendar_month"
+      );
+      expect(calendar.map((r) => r.id).sort()).toEqual([
+        `${PREFIX}ends_at_start`,
+        `${PREFIX}starts_at_end`,
+      ]);
+    });
+
+    it("leaves a cycle's own record alone when it is labelled calendar_month", async () => {
+      // billOverageForOrg labels the usage record `calendar_month` when the
+      // subscription has no period columns as it runs. The row has the
+      // record's exact window, so an overlap test alone would delete the only
+      // record of the cycle.
+      await setPlan("pro");
+      await addOverageRecord(CYCLE_START, CYCLE_END, "pending");
+      await addUsageRow("own_record", CYCLE_START, CYCLE_END, "calendar_month");
+
+      const summary = await repair();
+
+      expect(summary.cyclesRecorded).toHaveLength(0);
+      expect(summary.rowsRewritten).toHaveLength(0);
+      const rows = await storedRows();
       expect(rows).toHaveLength(1);
-      expect(rows[0]?.source).toBe("subscription");
+      expect(rows[0]?.id).toBe(`${PREFIX}own_record`);
+      expect(rows[0]?.source).toBe("calendar_month");
+    });
+
+    it("changes nothing on a second run", async () => {
+      await setPlan("pro");
+      await seedRowsAcrossBilledCycle();
+
+      await repair();
+      const afterFirst = await storedRowsById();
+      const second = await repair();
+
+      expect(second.cyclesRecorded).toHaveLength(0);
+      expect(second.rowsRewritten).toHaveLength(0);
+      expect(await storedRowsById()).toEqual(afterFirst);
+    });
+
+    it("reports a dry run and writes nothing", async () => {
+      await setPlan("pro");
+      await seedRowsAcrossBilledCycle();
+      const before = await storedRowsById();
+
+      const summary = await repair(true);
+
+      expect(summary.cyclesRecorded).toHaveLength(1);
+      expect(summary.rowsRewritten).toHaveLength(2);
+      expect(await storedRowsById()).toEqual(before);
+    });
+
+    it("leaves the close nothing to add or undo", async () => {
+      // The same shape inside the span the close looks at. The repair and the
+      // close decide a window through the same function, so a close that runs
+      // after the repair must find every row it would write already there.
+      const cycleStart = new Date(Date.UTC(2025, 11, 10));
+      const cycleEnd = new Date(Date.UTC(2026, 0, 10));
+      await setPlan("pro");
+      await addOverageRecord(cycleStart, cycleEnd);
+      await addUsageRow(
+        "december",
+        new Date(Date.UTC(2025, 11, 1)),
+        PERIOD_START,
+        "calendar_month",
+        2
+      );
+      await addUsageRow(
+        "january",
+        PERIOD_START,
+        PERIOD_END,
+        "calendar_month",
+        2
+      );
+      await addRun("before_cycle", new Date(Date.UTC(2025, 11, 5)));
+      await addRun("in_cycle_dec", new Date(Date.UTC(2025, 11, 20)));
+      await addRun("in_cycle_jan", new Date(Date.UTC(2026, 0, 5)));
+      await addRun("after_cycle", new Date(Date.UTC(2026, 0, 20)));
+
+      await repair();
+      const afterRepair = await storedRowsById();
+      const { closeCalendarMonthUsage } = await import(
+        "../../lib/billing/execution-usage-periods"
+      );
+      await closeCalendarMonthUsage(new Date(Date.UTC(2026, 1, 5)));
+
+      expect(await storedRowsById()).toEqual(afterRepair);
+      const calendar = afterRepair.filter((r) => r.source === "calendar_month");
+      expect(calendar).toHaveLength(1);
+      expect(calendar[0]?.periodEnd.toISOString()).toBe(
+        cycleStart.toISOString()
+      );
     });
   });
 });
