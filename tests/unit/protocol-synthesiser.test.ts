@@ -243,4 +243,87 @@ describe("synthesiseProtocolTemplate", () => {
       );
     });
   });
+
+  describe("layerzero/oft-send (payable, payer-owned refundAddress)", () => {
+    const actionId = "layerzero/oft-send";
+    // USDT0 OFT on mainnet.
+    const config = {
+      network: "1",
+      contractAddress: "0x6C96dE32CEa08842dcc4058c14d3aaAD7Fa41dee",
+    };
+
+    it("omits refundAddress from the Input type", () => {
+      const code = synthesiseProtocolTemplate(actionId, config) as string;
+      const inputType = /type Input = \{[\s\S]*?\};/.exec(code)?.[0];
+      expect(inputType).toBeDefined();
+      expect(inputType).not.toContain("refundAddress");
+      // Every other declared input is still typed.
+      expect(inputType).toContain("nativeFee: string;");
+    });
+
+    it("emits account.address for the payer arg, declared before its use", () => {
+      const code = synthesiseProtocolTemplate(actionId, config) as string;
+      expect(code).toContain(", account.address]");
+      // `account` comes from privateKeyToAccount before the simulation
+      // call reads the args list.
+      const accountAt = code.indexOf("privateKeyToAccount(");
+      const argsAt = code.indexOf("account.address");
+      expect(accountAt).toBeGreaterThanOrEqual(0);
+      expect(argsAt).toBeGreaterThan(accountAt);
+      // msg.value still reads the same nativeFee the OFT checks it
+      // against.
+      expect(code).toContain(
+        "value: input.nativeFee ? BigInt(input.nativeFee) : undefined"
+      );
+    });
+  });
+});
+
+describe("synthesiseProtocolTemplate: a renamed slug on an L2", () => {
+  // The generated code is the workflow the user is told they could run
+  // themselves, so it has to target what the step targets. Before the context
+  // became alias-aware, an old slug on an L2 emitted the zero address with a
+  // "no deployment recorded" comment for a workflow that runs correctly.
+  it("emits the bridged contract's address for an aliased node", () => {
+    const out = synthesiseProtocolTemplate("sky/vault-balance", {
+      network: "8453",
+    });
+
+    expect(out).not.toBeNull();
+    const code = out as string;
+
+    expect(code).toContain(
+      'const CONTRACT_ADDRESS = "0x5875eEE11Cf8398102FdAd704C9E96607675467a" as const'
+    );
+    expect(code).toContain('import { base } from "viem/chains"');
+    expect(code).toContain("process.env.BASE_RPC_URL");
+    expect(code).not.toContain("no deployment recorded");
+    expect(code).not.toContain("is not in viem/chains");
+  });
+
+  it("still emits the mainnet address off the renamed chains", () => {
+    const out = synthesiseProtocolTemplate("sky/vault-balance", {
+      network: "1",
+    });
+
+    expect(out).toContain(
+      'const CONTRACT_ADDRESS = "0xa3931d71877C0E7a3148CB7Eb4463524FEc27fbD" as const'
+    );
+  });
+
+  it("names the real reason when a chain viem knows carries no deployment", () => {
+    // Arbitrum is not one of wstETH's renamed chains, so nothing resolves
+    // there. The comment must say the deployment is missing, not that viem
+    // has never heard of chain 42161 - it ships it.
+    const out = synthesiseProtocolTemplate("lido/get-wsteth-balance", {
+      network: "42161",
+    });
+
+    expect(out).not.toBeNull();
+    const code = out as string;
+
+    expect(code).toContain("// no deployment recorded for chain id 42161");
+    expect(code).not.toContain("is not in viem/chains");
+    expect(code).toContain('import { arbitrum } from "viem/chains"');
+  });
 });

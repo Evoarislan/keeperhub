@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const DIRECT_ID_PREFIX_REGEX = /^direct-/;
 
@@ -12,6 +12,8 @@ const registry = vi.hoisted(() => ({
     symbol: string;
     isStablecoin: boolean;
   }>,
+  // safe_wallets rows feeding the ceiling's org-payer set.
+  safeRows: [] as Array<{ safeAddress: string }>,
 }));
 
 const {
@@ -52,16 +54,24 @@ vi.mock("@/lib/logging", () => ({
 
 vi.mock("@/lib/db", () => ({
   db: {
-    select: () => ({
-      from: () => ({
-        // The stablecoin ceiling awaits where() directly (it reads the chain's
-        // whole token list); other lookups end in limit().
-        where: () =>
-          Object.assign(Promise.resolve(registry.tokenRows), {
-            limit: () => Promise.resolve([]),
-          }),
-      }),
-    }),
+    // Branches on the selected columns, the only thing separating the
+    // ceiling's two reads through this stub.
+    select: (columns?: Record<string, unknown>) => {
+      const rows =
+        columns !== undefined && "safeAddress" in columns
+          ? registry.safeRows
+          : registry.tokenRows;
+      return {
+        from: () => ({
+          // The stablecoin ceiling awaits where() directly (it reads the chain's
+          // whole token list); other lookups end in limit().
+          where: () =>
+            Object.assign(Promise.resolve(rows), {
+              limit: () => Promise.resolve([]),
+            }),
+        }),
+      };
+    },
     query: {
       explorerConfigs: {
         findFirst: (...args: unknown[]) => mockFindExplorerConfig(...args),
@@ -72,6 +82,11 @@ vi.mock("@/lib/db", () => ({
 
 vi.mock("@/lib/db/schema", () => ({
   workflowExecutions: { id: "id", userId: "userId", workflowId: "workflowId" },
+  safeWallets: {
+    organizationId: "organizationId",
+    chainId: "chainId",
+    safeAddress: "safeAddress",
+  },
   explorerConfigs: { chainId: "chainId" },
   supportedTokens: {
     chainId: "chainId",
@@ -148,6 +163,27 @@ vi.mock("@/lib/abi/function-key", () => ({
   getAbiFunctionKey: vi.fn().mockReturnValue("transfer"),
 }));
 
+// Snapshot the args the stablecoin ceiling read at the moment it ran. The
+// core mutates the same array in place when it writes the payer argument,
+// so reading the recorded params object afterwards would show the final
+// value whether the check ran before or after the overwrite and could prove
+// nothing about ordering. The check itself stays real so the token-rows
+// cases still exercise the real matcher.
+let stablecoinCeilingArgsAtCall: unknown[] | undefined;
+vi.mock("@/lib/execute/stablecoin-cap", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/lib/execute/stablecoin-cap")>();
+  return {
+    ...actual,
+    checkStablecoinContractCall: (
+      params: Parameters<typeof actual.checkStablecoinContractCall>[0]
+    ) => {
+      stablecoinCeilingArgsAtCall = [...params.args];
+      return actual.checkStablecoinContractCall(params);
+    },
+  };
+});
+
 // Spy on executeContractCall so tests can inspect the gasOverrides arg.
 // Hoisted so the mock factory below sees an initialized value at module load.
 const { mockExecuteContractCall, mockGetTransactionUrl } = vi.hoisted(() => ({
@@ -221,12 +257,16 @@ vi.mock("@/lib/web3/sponsored-send-error", () => ({
     mockResolveSponsoredSendError(...args),
 }));
 
-vi.mock("@/lib/web3/sponsorship-feature-flag", () => ({
+vi.mock("@/lib/web3/sponsorship-feature-flag", async (importOriginal) => ({
+  ...(await importOriginal<
+    typeof import("@/lib/web3/sponsorship-feature-flag")
+  >()),
   isGasSponsorshipEnabled: () => mockIsGasSponsorshipEnabled(),
 }));
 
 vi.mock("@/lib/safe/execute-as-safe", () => ({
   executeContractCallAsSafe: vi.fn(),
+  executeContractCallAsRole: vi.fn(),
   executeNativeTransferAsSafe: vi.fn(),
 }));
 
@@ -261,8 +301,14 @@ import { ExecutionErrorType } from "@/lib/errors/execution-error-type";
 import { getChainIdFromNetwork } from "@/lib/rpc/network-utils";
 import { getRpcProvider } from "@/lib/rpc/provider-factory";
 import { RpcRelayTransportError } from "@/lib/rpc/providers/transport-error";
+import {
+  executeContractCallAsRole,
+  executeContractCallAsSafe,
+} from "@/lib/safe/execute-as-safe";
+import { resolveSignerForNode } from "@/lib/safe/signer-resolver";
 import { parsePriorityFeeGwei } from "@/lib/web3/gas-defaults";
 import { OnChainPendingError } from "@/lib/web3/onchain-revert";
+import { PreBroadcastNetworkError } from "@/lib/web3/submit-signed";
 // Import mocks for assertion
 import { initializeWalletSigner } from "@/lib/web3/wallet-helpers";
 // Import SUT after all mocks
@@ -286,6 +332,7 @@ const VALID_ABI = JSON.stringify([
 
 const MOCK_EXECUTED_CALL = {
   contractAddress: "0x1234567890123456789012345678901234567890",
+  from: "0x00000000000000000000000000000000000000d1",
   functionName: "transfer",
   functionSignature: "transfer(address,uint256)",
   args: { to: "0xrecipient", amount: "1000" },
@@ -301,6 +348,7 @@ describe("writeContractCore stablecoin ceiling", () => {
     vi.clearAllMocks();
     capturedTxContext = null;
     registry.tokenRows = [];
+    registry.safeRows = [];
   });
 
   it("refuses an over-cap USDC transfer routed through a raw contract call", async () => {
@@ -334,7 +382,7 @@ describe("writeContractCore stablecoin ceiling", () => {
     if (!result.success) {
       expect(result.error).toContain("per-transaction limit");
     }
-    // Refused before the wallet is even resolved, so nothing is signed.
+    // Refused before the nonce session, so nothing is signed.
     expect(initializeWalletSigner).not.toHaveBeenCalled();
   });
 
@@ -369,6 +417,7 @@ describe("writeContractCore executedCall on direct send", () => {
     vi.clearAllMocks();
     capturedTxContext = null;
     registry.tokenRows = [];
+    registry.safeRows = [];
     mockTraceExecutedCall.mockResolvedValue(undefined);
   });
 
@@ -596,6 +645,7 @@ describe("writeContractCore broadcast with an unreadable receipt", () => {
     vi.clearAllMocks();
     capturedTxContext = null;
     registry.tokenRows = [];
+    registry.safeRows = [];
   });
 
   it("classifies the send as SYSTEM so failOnError cannot soften it", async () => {
@@ -666,6 +716,26 @@ describe("writeContractCore broadcast with an unreadable receipt", () => {
     }
     expect(applyFailOnError(result, false).success).toBe(true);
   });
+
+  it("retains the receipt hash when post-broadcast explorer decoration fails", async () => {
+    mockGetTransactionUrl.mockRejectedValueOnce(
+      new Error("explorer lookup unavailable")
+    );
+
+    const result = await writeContractCore({
+      contractAddress: "0x1234567890123456789012345678901234567890",
+      network: "ethereum",
+      abi: VALID_ABI,
+      abiFunction: "transfer",
+      _context: { organizationId: "org-1" },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.transactionHash).toBe("0xhash");
+      expect(result.broadcastAttempted).toBe(true);
+    }
+  });
 });
 
 describe("writeContractCore sponsored-relay failure link", () => {
@@ -673,6 +743,7 @@ describe("writeContractCore sponsored-relay failure link", () => {
     vi.clearAllMocks();
     capturedTxContext = null;
     registry.tokenRows = [];
+    registry.safeRows = [];
     mockIsGasSponsorshipEnabled.mockReturnValue(false);
     mockExecuteSponsoredContractTransaction.mockResolvedValue(null);
     mockResolveSponsoredSendError.mockReturnValue({ fallback: true });
@@ -717,6 +788,85 @@ describe("writeContractCore sponsored-relay failure link", () => {
       "0xsponsored"
     );
     expect(mockExecuteContractCall).not.toHaveBeenCalled();
+  });
+});
+
+describe("writeContractCore Sponsor gas toggle", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    capturedTxContext = null;
+    registry.tokenRows = [];
+    registry.safeRows = [];
+    mockIsGasSponsorshipEnabled.mockReturnValue(true);
+    mockExecuteSponsoredContractTransaction.mockResolvedValue({
+      transactionHash: "0xsponsored",
+      gasUsed: "21000",
+      gasUsedUnits: "21000",
+      effectiveGasPrice: "1000000000",
+    });
+    mockResolveSponsoredSendError.mockReturnValue({ fallback: true });
+    mockFindExplorerConfig.mockResolvedValue(null);
+    mockExecuteContractCall.mockResolvedValue({
+      hash: "0xhash",
+      gasUsed: BigInt(21_000),
+      effectiveGasPrice: BigInt(1_000_000_000),
+    });
+  });
+
+  // clearAllMocks keeps implementations, so the sponsored success set up here
+  // would follow the suite into every later describe.
+  afterEach(() => {
+    mockIsGasSponsorshipEnabled.mockReturnValue(false);
+    mockExecuteSponsoredContractTransaction.mockResolvedValue(null);
+  });
+
+  it("takes the sponsored route when the toggle is unset", async () => {
+    const result = await writeContractCore({
+      contractAddress: "0x1234567890123456789012345678901234567890",
+      network: "ethereum",
+      abi: VALID_ABI,
+      abiFunction: "transfer",
+      _context: { organizationId: "org-1" },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.sponsored).toBe(true);
+      expect(result.transactionHash).toBe("0xsponsored");
+    }
+    expect(mockExecuteContractCall).not.toHaveBeenCalled();
+  });
+
+  it("signs directly and spends no sponsorship credit when the toggle is off", async () => {
+    const result = await writeContractCore({
+      contractAddress: "0x1234567890123456789012345678901234567890",
+      network: "ethereum",
+      abi: VALID_ABI,
+      abiFunction: "transfer",
+      sponsorGas: false,
+      _context: { organizationId: "org-1" },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.transactionHash).toBe("0xhash");
+    }
+    expect(mockExecuteSponsoredContractTransaction).not.toHaveBeenCalled();
+    expect(mockExecuteContractCall).toHaveBeenCalled();
+  });
+
+  it('reads the "false" string the editor may persist as off', async () => {
+    await writeContractCore({
+      contractAddress: "0x1234567890123456789012345678901234567890",
+      network: "ethereum",
+      abi: VALID_ABI,
+      abiFunction: "transfer",
+      sponsorGas: "false" as unknown as boolean,
+      _context: { organizationId: "org-1" },
+    });
+
+    expect(mockExecuteSponsoredContractTransaction).not.toHaveBeenCalled();
+    expect(mockExecuteContractCall).toHaveBeenCalled();
   });
 });
 
@@ -817,5 +967,347 @@ describe("writeContractCore functionArgs shape (#2359)", () => {
     });
     expect(result).toMatchObject({ success: false, errorClass: "user" });
     expect(mockExecuteContractCall).not.toHaveBeenCalled();
+  });
+});
+
+describe("writeContractCore broadcastAttempted evidence", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    capturedTxContext = null;
+    registry.tokenRows = [];
+    registry.safeRows = [];
+  });
+
+  it("reports broadcastAttempted: false for a tagged pre-broadcast connection refusal", async () => {
+    // The marker is applied by submitSignedTransactionWithFailover at the
+    // broadcast boundary, where provenance is known. This is the evidence
+    // that lets the disposition layer release the key: nothing was sent.
+    mockExecuteContractCall.mockRejectedValueOnce(
+      new PreBroadcastNetworkError(
+        "RPC failed on both endpoints. Primary: ECONNREFUSED. Fallback: ECONNREFUSED",
+        new Error("ECONNREFUSED")
+      )
+    );
+
+    const result = await writeContractCore({
+      contractAddress: "0x1234567890123456789012345678901234567890",
+      network: "ethereum",
+      abi: VALID_ABI,
+      abiFunction: "transfer",
+      _context: { organizationId: "org-1" },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.broadcastAttempted).toBe(false);
+      expect(result.transactionHash).toBeUndefined();
+    }
+  });
+
+  it("reports broadcastAttempted: true for a generic send failure", async () => {
+    mockExecuteContractCall.mockRejectedValueOnce(new Error("boom"));
+
+    const result = await writeContractCore({
+      contractAddress: "0x1234567890123456789012345678901234567890",
+      network: "ethereum",
+      abi: VALID_ABI,
+      abiFunction: "transfer",
+      _context: { organizationId: "org-1" },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.broadcastAttempted).toBe(true);
+    }
+  });
+
+  it("fails closed on an untagged error whose text matches a connection refusal", async () => {
+    // The blocker regression: an ECONNREFUSED rendered by executeWithFailover
+    // for the post-broadcast receipt poll or the nonce bookkeeping insert is
+    // text-identical to a refused send. Without the tag, the core must NOT
+    // read it as "nothing was sent" -- the transaction may be in the mempool.
+    mockExecuteContractCall.mockRejectedValueOnce(
+      new Error(
+        "RPC failed on both endpoints. Primary: ECONNREFUSED. Fallback: ECONNREFUSED"
+      )
+    );
+
+    const result = await writeContractCore({
+      contractAddress: "0x1234567890123456789012345678901234567890",
+      network: "ethereum",
+      abi: VALID_ABI,
+      abiFunction: "transfer",
+      _context: { organizationId: "org-1" },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.broadcastAttempted).toBe(true);
+    }
+  });
+});
+
+describe("writeContractCore payerParam (#2470)", () => {
+  const PAYER_ABI = JSON.stringify([
+    {
+      type: "function",
+      name: "send",
+      stateMutability: "payable",
+      inputs: [
+        { name: "a", type: "uint256" },
+        { name: "refundAddress", type: "address" },
+      ],
+      outputs: [],
+    },
+  ]);
+  const PLACEHOLDER = "0x0000000000000000000000000000000000000000";
+  const SAFE_ADDRESS = "0x9999999999999999999999999999999999999999";
+  // Matches the getOrganizationWalletAddress mock above.
+  const ORG_WALLET = "0xwalletaddress1234567890123456789012345678";
+  const OUTSIDE_PAYER = "0x2222222222222222222222222222222222222222";
+  const RECIPIENT = "0x3333333333333333333333333333333333333333";
+  const USDS_CONTRACT = "0xdC035D45d973E3EC169d2276DDab16f1e407384F";
+  // 1,000 USDS at 18 decimals, ten times the 100 USD ceiling.
+  const OVER_CAP_USDS = "1000000000000000000000";
+  const TRANSFER_FROM_ABI = JSON.stringify([
+    {
+      type: "function",
+      name: "transferFrom",
+      stateMutability: "nonpayable",
+      inputs: [
+        { name: "from", type: "address" },
+        { name: "to", type: "address" },
+        { name: "amount", type: "uint256" },
+      ],
+      outputs: [],
+    },
+  ]);
+  const RECEIPT = {
+    hash: "0xhash",
+    gasUsed: BigInt(21_000),
+    effectiveGasPrice: BigInt(1_000_000_000),
+    blockNumber: 1,
+  };
+
+  const baseInput = {
+    contractAddress: "0x1234567890123456789012345678901234567890",
+    network: "ethereum",
+    abi: PAYER_ABI,
+    abiFunction: "send",
+    functionArgs: JSON.stringify(["1", PLACEHOLDER]),
+    _context: { organizationId: "org-1" },
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    capturedTxContext = null;
+    registry.tokenRows = [];
+    registry.safeRows = [];
+    stablecoinCeilingArgsAtCall = undefined;
+    mockExecuteContractCall.mockResolvedValue(RECEIPT);
+    vi.mocked(executeContractCallAsSafe).mockResolvedValue(RECEIPT);
+    vi.mocked(executeContractCallAsRole).mockResolvedValue(RECEIPT);
+    vi.mocked(resolveSignerForNode).mockResolvedValue({
+      kind: "eoa",
+      ownerAddress: "0xwalletaddress",
+    });
+  });
+
+  it("sets the payer argument to the org wallet in eoa mode", async () => {
+    const result = await writeContractCore({
+      ...baseInput,
+      payerParam: "refundAddress",
+    });
+
+    expect(result.success).toBe(true);
+    const sent = mockExecuteContractCall.mock.calls[0]?.[1] as {
+      args: unknown[];
+    };
+    expect(sent.args).toEqual(["1", ORG_WALLET]);
+  });
+
+  it("sets the payer argument to the Safe in safe mode", async () => {
+    vi.mocked(resolveSignerForNode).mockResolvedValue({
+      kind: "safe",
+      ownerAddress: "0xwalletaddress",
+      safeAddress: SAFE_ADDRESS,
+      safeWalletId: "safe-1",
+    });
+
+    const result = await writeContractCore({
+      ...baseInput,
+      payerParam: "refundAddress",
+    });
+
+    expect(result.success).toBe(true);
+    const sent = vi.mocked(executeContractCallAsSafe).mock.calls[0]?.[1] as {
+      args: unknown[];
+    };
+    expect(sent.args).toEqual(["1", SAFE_ADDRESS]);
+    expect(mockExecuteContractCall).not.toHaveBeenCalled();
+  });
+
+  it("sets the payer argument to the Safe in safe-role mode", async () => {
+    vi.mocked(resolveSignerForNode).mockResolvedValue({
+      kind: "safe-role",
+      ownerAddress: "0xwalletaddress",
+      safeAddress: SAFE_ADDRESS,
+      safeWalletId: "safe-1",
+      rolesModifierAddress: "0xrolesmodifier0000000000000000000000",
+      roleKey: "0xrolekey",
+      delegateAddress: "0xdelegate0000000000000000000000000000",
+    });
+
+    const result = await writeContractCore({
+      ...baseInput,
+      payerParam: "refundAddress",
+    });
+
+    expect(result.success).toBe(true);
+    const sent = vi.mocked(executeContractCallAsRole).mock.calls[0]?.[1] as {
+      args: unknown[];
+    };
+    expect(sent.args).toEqual(["1", SAFE_ADDRESS]);
+    expect(mockExecuteContractCall).not.toHaveBeenCalled();
+  });
+
+  it("fails without broadcasting when payerParam is not an address argument", async () => {
+    for (const bad of ["a", "notAParam"]) {
+      vi.clearAllMocks();
+      mockExecuteContractCall.mockResolvedValue(RECEIPT);
+      vi.mocked(resolveSignerForNode).mockResolvedValue({
+        kind: "eoa",
+        ownerAddress: "0xwalletaddress",
+      });
+
+      const result = await writeContractCore({
+        ...baseInput,
+        payerParam: bad,
+      });
+
+      expect([bad, result.success]).toEqual([bad, false]);
+      expect(mockExecuteContractCall).not.toHaveBeenCalled();
+      expect(executeContractCallAsSafe).not.toHaveBeenCalled();
+      expect(executeContractCallAsRole).not.toHaveBeenCalled();
+    }
+  });
+
+  it("leaves args untouched when payerParam is absent", async () => {
+    const result = await writeContractCore({ ...baseInput });
+
+    expect(result.success).toBe(true);
+    const sent = mockExecuteContractCall.mock.calls[0]?.[1] as {
+      args: unknown[];
+    };
+    expect(sent.args).toEqual(["1", PLACEHOLDER]);
+  });
+
+  it("refuses an over-cap transferFrom whose payer argument the core rewrites", async () => {
+    // The ceiling decides on the payer the broadcast carries, so a call that
+    // names an outside address and hands the core payerParam is measured as
+    // an org outflow and refused.
+    registry.tokenRows = [
+      {
+        tokenAddress: USDS_CONTRACT,
+        decimals: 18,
+        symbol: "USDS",
+        isStablecoin: true,
+      },
+    ];
+
+    const result = await writeContractCore({
+      ...baseInput,
+      contractAddress: USDS_CONTRACT,
+      abi: TRANSFER_FROM_ABI,
+      abiFunction: "transferFrom",
+      functionArgs: JSON.stringify([OUTSIDE_PAYER, RECIPIENT, OVER_CAP_USDS]),
+      payerParam: "from",
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("per-transaction limit");
+    }
+    expect(mockExecuteContractCall).not.toHaveBeenCalled();
+    expect(executeContractCallAsSafe).not.toHaveBeenCalled();
+    expect(executeContractCallAsRole).not.toHaveBeenCalled();
+  });
+
+  it("refuses the same call when the Safe pays for it", async () => {
+    vi.mocked(resolveSignerForNode).mockResolvedValue({
+      kind: "safe",
+      ownerAddress: "0xwalletaddress",
+      safeAddress: SAFE_ADDRESS,
+      safeWalletId: "safe-1",
+    });
+    registry.tokenRows = [
+      {
+        tokenAddress: USDS_CONTRACT,
+        decimals: 18,
+        symbol: "USDS",
+        isStablecoin: true,
+      },
+    ];
+    registry.safeRows = [{ safeAddress: SAFE_ADDRESS }];
+
+    const result = await writeContractCore({
+      ...baseInput,
+      contractAddress: USDS_CONTRACT,
+      abi: TRANSFER_FROM_ABI,
+      abiFunction: "transferFrom",
+      functionArgs: JSON.stringify([OUTSIDE_PAYER, RECIPIENT, OVER_CAP_USDS]),
+      payerParam: "from",
+    });
+
+    expect(result.success).toBe(false);
+    expect(executeContractCallAsSafe).not.toHaveBeenCalled();
+  });
+
+  it("still allows an over-cap collection from a counterparty", async () => {
+    // No payerParam, so the counterparty stays the payer and the pull payment
+    // the ceiling exempts keeps working.
+    registry.tokenRows = [
+      {
+        tokenAddress: USDS_CONTRACT,
+        decimals: 18,
+        symbol: "USDS",
+        isStablecoin: true,
+      },
+    ];
+
+    const result = await writeContractCore({
+      ...baseInput,
+      contractAddress: USDS_CONTRACT,
+      abi: TRANSFER_FROM_ABI,
+      abiFunction: "transferFrom",
+      functionArgs: JSON.stringify([OUTSIDE_PAYER, RECIPIENT, OVER_CAP_USDS]),
+    });
+
+    expect(result.success).toBe(true);
+    const sent = mockExecuteContractCall.mock.calls[0]?.[1] as {
+      args: unknown[];
+    };
+    expect(sent.args).toEqual([OUTSIDE_PAYER, RECIPIENT, OVER_CAP_USDS]);
+  });
+
+  it("runs the stablecoin ceiling on the payer-written args, not the caller's", async () => {
+    // The ceiling has to read the payer the broadcast carries, not the one
+    // the caller supplied.
+    const result = await writeContractCore({
+      ...baseInput,
+      abi: TRANSFER_FROM_ABI,
+      abiFunction: "transferFrom",
+      functionArgs: JSON.stringify([OUTSIDE_PAYER, RECIPIENT, "1000"]),
+      payerParam: "from",
+    });
+
+    expect(result.success).toBe(true);
+    // Snapshot taken at call time (see the module mock): a live reference to
+    // args would read the rewritten value even on the old ordering.
+    expect(stablecoinCeilingArgsAtCall?.[0]).toBe(ORG_WALLET);
+    const sent = mockExecuteContractCall.mock.calls[0]?.[1] as {
+      args: unknown[];
+    };
+    expect(sent.args).toEqual([ORG_WALLET, RECIPIENT, "1000"]);
   });
 });

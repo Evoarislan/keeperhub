@@ -17,9 +17,16 @@ import {
   type ValidationWarningCode,
 } from "@/lib/mcp/validate-workflow-codes";
 import {
+  type ChainWebsockets,
+  eventTriggerRegistration,
+  type ProtocolEventAddressResolver,
+} from "@/lib/mcp/validate-workflow-trigger";
+import {
   chainExists,
   tokenAddressFormat,
 } from "@/lib/mcp/validate-workflow-web3";
+import { parsePythTriggerConfig } from "@/lib/pyth/price-trigger";
+import { findPythTriggerNode } from "@/lib/pyth/trigger-config";
 
 export type ValidationIssue = {
   code: ValidationErrorCode | ValidationWarningCode;
@@ -55,6 +62,20 @@ export type ValidateWorkflowOptions = {
    * entirely (no false errors).
    */
   chainIds?: Set<number>;
+  /**
+   * Pre-fetched `chains.default_primary_wss` keyed by chain ID. Same contract
+   * as `chainIds`: the caller does the query, and omitting it SKIPS the
+   * Event-trigger WebSocket check rather than reporting every trigger as
+   * unregisterable.
+   */
+  chainWebsockets?: ChainWebsockets;
+  /**
+   * Resolves a protocol event's contract address the way the events route
+   * does before the tracker sees the node. Same contract again: omitting it
+   * SKIPS the check on triggers built from a protocol event, rather than
+   * reporting them all as missing an address.
+   */
+  resolveProtocolEventAddress?: ProtocolEventAddressResolver;
 };
 
 export function validateWorkflow(
@@ -69,6 +90,21 @@ export function validateWorkflow(
   const nodeIds = collectNodeIds(workflow.nodes);
   runEdgeRefCheck(workflow, nodeIds, errors);
   runTriggerConfigCheck(workflow, errors);
+  const pythTrigger = findPythTriggerNode(workflow.nodes);
+  if (pythTrigger) {
+    try {
+      parsePythTriggerConfig(pythTrigger.config);
+    } catch (error) {
+      errors.push({
+        code: VALIDATION_ERROR_CODES.MISSING_TRIGGER_CONFIG,
+        message:
+          error instanceof Error
+            ? error.message
+            : "Invalid Pyth trigger configuration",
+        parameterPath: `nodes[${pythTrigger.index}].data.config`,
+      });
+    }
+  }
   runBareAtCheck(workflow, errors);
 
   // VALID-03 listing-eligibility (only when isListed)
@@ -82,7 +118,14 @@ export function validateWorkflow(
 
   // Allowance preflight hint: a write-contract node calling an
   // allowance-consuming method with no check-allowance node in the workflow.
-  runAllowancePreflightCheck(workflow, warnings);
+  // The grant side of the same seam runs right after it on the same gate:
+  // an approve with no check-allowance upstream, and no earlier approve of
+  // the same token to the same spender.
+  runAllowanceChecks(workflow, warnings);
+
+  // Signer-routing hint: a signed write names an integration with a key the
+  // runtime does not read for routing.
+  runSignerRoutingCheck(workflow, warnings);
 
   // VALID-05: chain ID existence — only when caller pre-fetched chainIds.
   // Per-node check mitigates Pitfall 12 (multi-chain WETH false positives).
@@ -94,6 +137,18 @@ export function validateWorkflow(
 
   // VALID-06: token / contract address format (always runs — no DB needed)
   for (const issue of tokenAddressFormat(workflow.nodes)) {
+    errors.push(issue);
+  }
+
+  // Event-trigger registration: the conditions under which the event tracker
+  // declines to register the workflow and nothing reaches the user. The
+  // WebSocket check inside needs opts.chainWebsockets and the protocol-event
+  // address check needs opts.resolveProtocolEventAddress; the rest need nothing.
+  for (const issue of eventTriggerRegistration(
+    workflow.nodes,
+    opts.chainWebsockets,
+    opts.resolveProtocolEventAddress
+  )) {
     errors.push(issue);
   }
 
@@ -327,10 +382,16 @@ function runWriteActionCheck(
   }
 
   if (workflow.workflowType === "read" && hasWriteAction) {
+    // The stored type can lag the nodes (create, duplicate and import do not
+    // derive it), so the fix an agent is told to make has to work: an unlisted
+    // save derives the type, but on a listed row update_workflow will not
+    // change it, and an edit that keeps a write node is refused with
+    // WORKFLOW_TYPE_FROZEN.
     warnings.push({
       code: VALIDATION_WARNING_CODES.WRITE_ACTION_ON_READ_WORKFLOW,
-      message:
-        'workflowType is "read" but workflow contains a write-action node. Confirm this is intentional.',
+      message: workflow.isListed
+        ? 'workflowType is "read" but workflow contains a write-action node. The workflow is listed, so update_workflow will not change its type: an edit that keeps a write-action node is refused with WORKFLOW_TYPE_FROZEN. Remove the write-action node, or unlist the workflow and save it to derive "write".'
+        : 'workflowType is "read" but workflow contains a write-action node. The stored type is derived from nodes on save, so saving the workflow once sets it to "write".',
       parameterPath: "workflowType",
     });
   }
@@ -355,6 +416,14 @@ type NodeActionConfig = {
   actionType: unknown;
   abiFunction: unknown;
   calls: unknown;
+  contractAddress: unknown;
+  functionArgs: unknown;
+  tokenConfig: unknown;
+  tokenAddress: unknown;
+  spenderAddress: unknown;
+  amount: unknown;
+  abi: unknown;
+  integrationId: unknown;
 };
 
 function readNodeActionConfig(node: unknown): NodeActionConfig | null {
@@ -372,7 +441,19 @@ function readNodeActionConfig(node: unknown): NodeActionConfig | null {
   const cfg = config as Record<string, unknown>;
   const actionType =
     cfg.actionType ?? (data as Record<string, unknown>).actionType;
-  return { actionType, abiFunction: cfg.abiFunction, calls: cfg.calls };
+  return {
+    actionType,
+    abiFunction: cfg.abiFunction,
+    calls: cfg.calls,
+    contractAddress: cfg.contractAddress,
+    functionArgs: cfg.functionArgs,
+    tokenConfig: cfg.tokenConfig,
+    tokenAddress: cfg.tokenAddress,
+    spenderAddress: cfg.spenderAddress,
+    amount: cfg.amount,
+    abi: cfg.abi,
+    integrationId: cfg.integrationId,
+  };
 }
 
 function bareMethodName(abiFunction: unknown): string | null {
@@ -575,7 +656,83 @@ function isAllowanceGated(gate: AllowanceGate, node: unknown): boolean {
   return false;
 }
 
-function runAllowancePreflightCheck(
+// `integrationId` is read by no web3 step — zero references under
+// `plugins/web3/` — and the editor never writes it on a web3-credential
+// action, because `action-config.tsx:1123-1137` renders that slot as either
+// the Web3 Connection selector or the integration selector, never both. The
+// key is inert by construction on a `web3/*` node and only reachable from the
+// API or MCP surface, which is where an agent composing config lands.
+//
+// The rule deliberately does NOT test whether `web3Connection` is absent.
+// `parseWeb3Connection` maps missing, empty and `"default"` to one branch
+// (`lib/safe/signer-resolver.ts:361`), so those three states resolve to the
+// same signer; a rule that fired only when the key were absent could be
+// silenced by writing `"default"`, which changes nothing.
+//
+// Absence is also the safer state, not a broken one:
+// `plugins/web3/steps/write-contract-core.ts:88-90` routes a missing value to
+// the org-policy resolver, and `/api/execute/node` strips the field from
+// caller config on purpose so a write honours the org Safe and its active
+// Zodiac Role. The message therefore never describes routing as "unset" and
+// never suggests `"eoa"`, which is the branch that bypasses that policy.
+//
+// The message also makes no claim about which signer this node resolves to.
+// `integrationId` can sit beside any `web3Connection` value, and `"eoa"` and
+// `"safe:<id>"` both override org policy, so a policy clause would be false on
+// those branches. Every sentence describes the fields, not this node's signer.
+//
+// Scoped to the action types `isWriteActionType` covers plus the three below.
+// No seed workflow sets `integrationId`, so this rule starts at zero against
+// the 43 workflows under `scripts/seed/workflows`.
+//
+// `lib/mcp/action-type.ts:33-46` keeps these three out of `isWriteActionType`
+// on purpose - their config carries no raw ABI, so the calldata-handoff route
+// cannot serve them and widening that helper would let them validate as
+// `workflowType: "write"` and then fail every MCP call. They resolve a signer
+// from `web3Connection` all the same - `approve-token-core.ts:262`,
+// `transfer-funds-core.ts:261`, `transfer-token-core.ts:388` - so
+// `integrationId` is inert on them for the same reason it is on a write.
+const SIGNER_ROUTED_ACTION_TYPES = new Set([
+  "web3/approve-token",
+  "web3/transfer-funds",
+  "web3/transfer-token",
+]);
+
+function isSignerRoutedActionType(actionType: unknown): boolean {
+  return (
+    isWriteActionType(actionType) ||
+    (typeof actionType === "string" &&
+      SIGNER_ROUTED_ACTION_TYPES.has(actionType))
+  );
+}
+
+function runSignerRoutingCheck(
+  workflow: ValidatorWorkflow,
+  warnings: ValidationIssue[]
+): void {
+  if (!Array.isArray(workflow.nodes)) {
+    return;
+  }
+  for (const [idx, node] of workflow.nodes.entries()) {
+    const cfg = readNodeActionConfig(node);
+    if (cfg === null || !isSignerRoutedActionType(cfg.actionType)) {
+      continue;
+    }
+    if (typeof cfg.integrationId !== "string" || cfg.integrationId === "") {
+      continue;
+    }
+    warnings.push({
+      code: VALIDATION_WARNING_CODES.SIGNER_ROUTING_KEY_IGNORED,
+      message: `nodes[${idx}].config sets "integrationId", which no web3 step reads. The signer for a signed write is resolved from "web3Connection" only, so this value has no effect on which wallet signs; remove it. Use "web3Connection" only when this node needs a signer other than the one organization policy would pick; leaving it absent, empty or "default" routes the node through that policy.`,
+      parameterPath: `nodes[${idx}].config.integrationId`,
+    });
+  }
+}
+
+// Both allowance checks share one gate: the graph walk and its memoised
+// ancestor sets are the expensive half, and the two checks ask it the same
+// question about different nodes.
+function runAllowanceChecks(
   workflow: ValidatorWorkflow,
   warnings: ValidationIssue[]
 ): void {
@@ -583,8 +740,16 @@ function runAllowancePreflightCheck(
     return;
   }
   const gate = buildAllowanceGate(workflow);
+  runAllowancePreflightCheck(workflow.nodes, gate, warnings);
+  runApproveGateCheck(workflow.nodes, gate, warnings);
+}
 
-  for (const [idx, node] of workflow.nodes.entries()) {
+function runAllowancePreflightCheck(
+  nodes: unknown[],
+  gate: AllowanceGate,
+  warnings: ValidationIssue[]
+): void {
+  for (const [idx, node] of nodes.entries()) {
     const cfg = readNodeActionConfig(node);
     if (cfg === null) {
       continue;
@@ -623,6 +788,378 @@ function runAllowancePreflightCheck(
         code: VALIDATION_WARNING_CODES.MISSING_ALLOWANCE_PREFLIGHT,
         message: `nodes[${idx}].config calls "${method}", which moves tokens via an existing allowance, but no web3/check-allowance node is upstream of it. Add an upstream web3/check-allowance node before this write to avoid an "insufficient allowance" revert at execution time.`,
         parameterPath: `nodes[${idx}].config.abiFunction`,
+      });
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Approve gate: the grant side of the allowance seam.
+//
+// An approve with no upstream allowance read runs blind: it cannot know whether
+// the spender already holds enough allowance, so it cannot skip itself. That
+// is worth a hint, and only a hint: this module reads no chain state. What the
+// hint can say depends on the configured amount. An unlimited approve ("max"
+// on an Approve Token node; MaxUint256 in decimal or hex as the raw second
+// argument of a write-contract approve) stays in place once it has landed, so
+// every later run re-grants what is already there; an exact-amount approve is consumed by the
+// spend after it and is needed every run. The message says which of the two
+// it is looking at, and says nothing about redundancy when the amount is a
+// template reference.
+//
+// Covers web3/approve-token and a web3/write-contract whose method is
+// `approve`. Protocol nodes are out of scope here: their method is not in the
+// config this module reads, and that resolution is its own seam. Batch nodes
+// are out for the reason given at approveGrantsOf.
+//
+// Two gates suppress the hint. An upstream allowance read (the same
+// reachability rule the spend-side warning uses), and an upstream approve of
+// the same token to the same spender, since the second approve then has a
+// grant it can be reasoned about against. Both addresses have to resolve to
+// literal values on both nodes for the second gate to apply; a template
+// reference or a supported-token id that cannot be compared never satisfies
+// it, so less information never hides a warning.
+// ---------------------------------------------------------------------------
+
+const APPROVE_TOKEN_ACTION_TYPE = "web3/approve-token";
+const APPROVE_METHOD = "approve";
+const EVM_ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
+// approve-token-core special-cases only "max" (ethers.MaxUint256); every other
+// string on an Approve Token node goes through parseUnits in the token's
+// decimals, so a decimal MaxUint256 there scales past uint256 and a hex string
+// is not a decimal at all. The raw spellings below belong to a write-contract
+// approve, whose second argument is already in raw units.
+const MAX_UINT256_BIGINT = BigInt(2) ** BigInt(256) - BigInt(1);
+const MAX_UINT256 = MAX_UINT256_BIGINT.toString();
+const DECIMAL_AMOUNT_PATTERN = /^\d+(\.\d+)?$/;
+const HEX_AMOUNT_PATTERN = /^0x[0-9a-fA-F]+$/;
+const ZERO_AMOUNT_PATTERN = /^0+(\.0+)?$/;
+const HUMAN_READABLE_FUNCTION = /^function\s+([A-Za-z_$][\w$]*)\s*\(/;
+// Functions no ERC-20 declares. An ABI carrying one is a token where the
+// second argument of approve is a token id and allowance has no meaning.
+const NON_ERC20_MARKERS = ["ownerOf", "setApprovalForAll"];
+
+// "zero" is a revoke: it is neither blind nor re-granting anything, so it
+// does not get the hint at all.
+type ApproveAmount = "unlimited" | "exact" | "zero" | "unknown";
+
+type ApproveGrant = {
+  /** Lower-cased token contract address, when it resolves to a literal. */
+  token: string | null;
+  /** Lower-cased spender address, when it resolves to a literal. */
+  spender: string | null;
+  /** What the approve grants, when the amount is a literal the reader can see. */
+  amount: ApproveAmount;
+  /** Where the hint should point. */
+  parameterPath: string;
+};
+
+// The amount on an Approve Token node, as approve-token-core reads it: "max"
+// is the one unlimited spelling, a plain decimal is an exact amount in the
+// token's units (zero is a revoke), and anything else, a hex string or a
+// decimal MaxUint256 included, is a value the action will not send as
+// written, so the hint makes no claim about it.
+function approveTokenAmountOf(raw: unknown): ApproveAmount {
+  if (typeof raw === "number") {
+    if (!(Number.isFinite(raw) && Number.isInteger(raw)) || raw < 0) {
+      return "unknown";
+    }
+    return raw === 0 ? "zero" : "exact";
+  }
+  if (typeof raw !== "string") {
+    return "unknown";
+  }
+  const amount = raw.trim();
+  if (amount.toLowerCase() === "max") {
+    return "unlimited";
+  }
+  if (!DECIMAL_AMOUNT_PATTERN.test(amount)) {
+    return "unknown";
+  }
+  if (ZERO_AMOUNT_PATTERN.test(amount)) {
+    return "zero";
+  }
+  // parseUnits scales the integer part up, so a decimal this large has no
+  // sendable value behind it and the hint claims nothing about it.
+  const whole = BigInt(amount.split(".")[0]);
+  return whole >= MAX_UINT256_BIGINT ? "unknown" : "exact";
+}
+
+// The second argument of a write-contract approve, in raw units: MaxUint256
+// in decimal or hex is unlimited, zero is a revoke, any other integer is exact.
+function approveAmountOf(raw: unknown): ApproveAmount {
+  if (typeof raw === "number") {
+    if (!(Number.isFinite(raw) && Number.isInteger(raw)) || raw < 0) {
+      return "unknown";
+    }
+    return raw === 0 ? "zero" : "exact";
+  }
+  if (typeof raw !== "string") {
+    return "unknown";
+  }
+  const amount = raw.trim();
+  if (amount.toLowerCase() === "max") {
+    return "unlimited";
+  }
+  if (HEX_AMOUNT_PATTERN.test(amount)) {
+    const value = BigInt(amount);
+    if (value === BigInt(0)) {
+      return "zero";
+    }
+    return value >= MAX_UINT256_BIGINT ? "unlimited" : "exact";
+  }
+  if (!DECIMAL_AMOUNT_PATTERN.test(amount)) {
+    return "unknown";
+  }
+  if (ZERO_AMOUNT_PATTERN.test(amount)) {
+    return "zero";
+  }
+  return amount === MAX_UINT256 ? "unlimited" : "exact";
+}
+
+// The function names a write-contract node's stored ABI declares, or null
+// when there is no parseable ABI. Entries may be JSON fragments or
+// human-readable signatures.
+function declaredFunctionNames(abi: unknown): Set<string> | null {
+  let parsed: unknown = abi;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return null;
+    }
+  }
+  if (!Array.isArray(parsed)) {
+    return null;
+  }
+  const names = new Set<string>();
+  for (const entry of parsed) {
+    if (typeof entry === "string") {
+      const match = HUMAN_READABLE_FUNCTION.exec(entry.trim());
+      if (match !== null) {
+        names.add(match[1]);
+      }
+      continue;
+    }
+    if (entry === null || typeof entry !== "object") {
+      continue;
+    }
+    const item = entry as { type?: unknown; name?: unknown };
+    if (item.type === "function" && typeof item.name === "string") {
+      names.add(item.name);
+    }
+  }
+  return names;
+}
+
+type TokenStandard = "erc20" | "not-erc20" | "unknown";
+
+function tokenStandardOf(abi: unknown): TokenStandard {
+  const names = declaredFunctionNames(abi);
+  if (names === null) {
+    return "unknown";
+  }
+  if (NON_ERC20_MARKERS.some((name) => names.has(name))) {
+    return "not-erc20";
+  }
+  return names.has("allowance") ? "erc20" : "unknown";
+}
+
+function literalAddress(value: unknown): string | null {
+  return typeof value === "string" && EVM_ADDRESS_PATTERN.test(value.trim())
+    ? value.trim().toLowerCase()
+    : null;
+}
+
+// The token an approve-token node targets: the custom token's address, or a
+// bare address in the legacy tokenAddress field. A platform-listed token is
+// identified by id rather than address in the config and cannot be compared
+// here, so it resolves to null and never matches.
+// Same precedence as parseTokenAddress in transfer-token-core: the legacy
+// tokenAddress counts only when there is no tokenConfig at all.
+function approveTokenAddress(cfg: NodeActionConfig): string | null {
+  let config: unknown = cfg.tokenConfig;
+  if (config === undefined || config === null || config === "") {
+    return literalAddress(cfg.tokenAddress);
+  }
+  if (typeof config === "string") {
+    const fromString = literalAddress(config);
+    if (fromString !== null) {
+      return fromString;
+    }
+    try {
+      config = JSON.parse(config);
+    } catch {
+      return null;
+    }
+  }
+  if (config === null || typeof config !== "object") {
+    return null;
+  }
+  const custom = (config as { customToken?: unknown }).customToken;
+  if (custom === null || typeof custom !== "object") {
+    return null;
+  }
+  return literalAddress((custom as { address?: unknown }).address);
+}
+
+function parseArgs(args: unknown): unknown[] {
+  let parsed: unknown = args;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return [];
+    }
+  }
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+// The approve grants a node makes, by node index: one for approve-token, one
+// for a write-contract calling approve. A revoke (amount zero) is returned so
+// it can suppress a later approve of the same token and spender, whose
+// allowance is then known to be zero, but it is never hinted itself.
+function approveGrantsOf(idx: number, cfg: NodeActionConfig): ApproveGrant[] {
+  if (cfg.actionType === APPROVE_TOKEN_ACTION_TYPE) {
+    return [
+      {
+        token: approveTokenAddress(cfg),
+        spender: literalAddress(cfg.spenderAddress),
+        amount: approveTokenAmountOf(cfg.amount),
+        parameterPath: `nodes[${idx}].config.spenderAddress`,
+      },
+    ];
+  }
+  // A batch node is left out on purpose: its calls run with msg.sender set
+  // to the Multicall3 contract, so an approve inside one grants Multicall3's
+  // allowance, not the wallet's. That is a different defect from a missing
+  // read, the batch node's own documentation covers it, and such an approve
+  // must not count as an earlier grant for a later approve either.
+  if (cfg.actionType === BATCH_WRITE_CONTRACT_ACTION_TYPE) {
+    return [];
+  }
+  if (
+    isWriteActionType(cfg.actionType) &&
+    bareMethodName(cfg.abiFunction) === APPROVE_METHOD
+  ) {
+    // approve(address,uint256) is the ERC-20 and the ERC-721 signature. The
+    // second argument is an amount only on an ERC-20; on an ERC-721 it is a
+    // token id and neither the hint nor its remedy means anything, so the
+    // declared ABI decides: a non-ERC-20 marker skips the node, an
+    // allowance function lets the amount be read, anything else reads no
+    // amount. A second argument of zero is read before that gate: it is a
+    // revoke on an ERC-20 and token id zero on an ERC-721, and the hint has
+    // nothing to say about either.
+    const args = parseArgs(cfg.functionArgs);
+    const zero = approveAmountOf(args[1]) === "zero";
+    const standard = tokenStandardOf(cfg.abi);
+    if (!zero && standard === "not-erc20") {
+      return [];
+    }
+    let amount: ApproveAmount = "unknown";
+    if (zero) {
+      amount = "zero";
+    } else if (standard === "erc20") {
+      amount = approveAmountOf(args[1]);
+    }
+    return [
+      {
+        token: literalAddress(cfg.contractAddress),
+        spender: literalAddress(args[0]),
+        amount,
+        parameterPath: `nodes[${idx}].config.abiFunction`,
+      },
+    ];
+  }
+  return [];
+}
+
+/** Token and spender match, whatever either approve's amount is. */
+function sameGrant(a: ApproveGrant, b: ApproveGrant): boolean {
+  return (
+    a.token !== null &&
+    a.spender !== null &&
+    a.token === b.token &&
+    a.spender === b.spender
+  );
+}
+
+const APPROVE_REMEDY =
+  "To skip it when the allowance already covers the amount, add a web3/check-allowance node upstream and a Condition on its allowance output that routes around this approve; the check alone only reads.";
+
+function approveHintMessage(idx: number, grant: ApproveGrant): string {
+  const target =
+    grant.spender === null ? "its spender" : `spender ${grant.spender}`;
+  const lead = `nodes[${idx}].config approves ${target} without reading the current allowance first: no web3/check-allowance node is upstream of it.`;
+  switch (grant.amount) {
+    case "unlimited":
+      return `${lead} This approve is unlimited, so once it has landed every later run re-grants an allowance that is already in place. ${APPROVE_REMEDY}`;
+    case "exact":
+      return `${lead} This approve is for an exact amount, which the spend after it consumes, so it is needed on every run; this is a hint, not a redundancy claim. ${APPROVE_REMEDY}`;
+    default:
+      return `${lead} ${APPROVE_REMEDY}`;
+  }
+}
+
+function runApproveGateCheck(
+  nodes: unknown[],
+  gate: AllowanceGate,
+  warnings: ValidationIssue[]
+): void {
+  const grantsByNodeId = new Map<string, ApproveGrant[]>();
+  const entries: { idx: number; node: unknown; grants: ApproveGrant[] }[] = [];
+  for (const [idx, node] of nodes.entries()) {
+    const cfg = readNodeActionConfig(node);
+    if (cfg === null) {
+      continue;
+    }
+    const grants = approveGrantsOf(idx, cfg);
+    if (grants.length === 0) {
+      continue;
+    }
+    entries.push({ idx, node, grants });
+    const id = readNodeId(node);
+    if (id !== null) {
+      grantsByNodeId.set(id, grants);
+    }
+  }
+
+  for (const { idx, node, grants } of entries) {
+    if (isAllowanceGated(gate, node)) {
+      continue;
+    }
+    // A revoke is in the map above so it suppresses a later approve of the
+    // same grant - after it the allowance is known to be zero - but it is
+    // never hinted itself: it grants nothing and there is nothing to skip.
+    if (grants.every((g) => g.amount === "zero")) {
+      continue;
+    }
+    const id = readNodeId(node);
+    const upstream =
+      id !== null && gate.incoming !== null ? ancestorsOf(id, gate) : null;
+    for (const grant of grants) {
+      let granted = false;
+      if (upstream !== null && id !== null) {
+        for (const ancestorId of upstream) {
+          // On a cycle every node is an ancestor of every other, itself
+          // included; none of them ran earlier. Only a one-way ancestor counts.
+          if (ancestorId === id || ancestorsOf(ancestorId, gate).has(id)) {
+            continue;
+          }
+          const earlier = grantsByNodeId.get(ancestorId);
+          if (earlier?.some((g) => sameGrant(g, grant))) {
+            granted = true;
+            break;
+          }
+        }
+      }
+      if (granted) {
+        continue;
+      }
+      warnings.push({
+        code: VALIDATION_WARNING_CODES.APPROVE_WITHOUT_ALLOWANCE_CHECK,
+        message: approveHintMessage(idx, grant),
+        parameterPath: grant.parameterPath,
       });
     }
   }

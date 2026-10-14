@@ -193,8 +193,8 @@ bounded backoff. Connection errors and DNS failures are **not** cold-start signa
 
 Most MCP tool calls use a 55-second client-side fetch timeout. Long-running
 execute tools (`execute_workflow`, `execute_transfer`, `execute_contract_call`,
-`execute_check_and_execute`, `execute_protocol_action`, `call_workflow`,
-`get_direct_execution_status`) disable that cap so on-chain work is not aborted
+`execute_check_and_execute`, `execute_protocol_action`, `top_up_gas`,
+`call_workflow`, `get_direct_execution_status`) disable that cap so on-chain work is not aborted
 mid-flight.
 
 ### Execution
@@ -224,6 +224,7 @@ mid-flight.
 | `execute_transfer` | Transfer native or ERC20 tokens to a recipient. Requires a wallet integration. |
 | `execute_contract_call` | Call a smart contract function. Returns the result for view/pure calls, or an execution ID for state-changing calls. |
 | `execute_check_and_execute` | Read one supported scalar and conditionally execute an action. Solidity integers support every operator; `address` and `bytes1` through `bytes32` support `eq`/`neq`. |
+| `top_up_gas` | Convert USDC in the org wallet into native ETH on the same wallet (approve, Uniswap swap with a server-side quoted floor, WETH unwrap; all gas-sponsored). Takes `chain_id` and `amount_usdc`, capped by the per-call stablecoin limit and a daily gas top-up limit per organization. No dry run. The response lists each step so a partial run is explicit. See [Gas Top-Up](/api/direct-execution#gas-top-up). |
 | `get_direct_execution_status` | Get the status of a direct execution (transfer or contract call), including the transaction hash and result. |
 
 ### Safely preflight direct writes
@@ -264,7 +265,7 @@ and the authoritative safe first-write sequence.
 
 | Tool | Description |
 |------|-------------|
-| `search_protocol_actions` | Search available protocol actions across supported DeFi protocols. Call this first to discover actions and their parameters. |
+| `search_protocol_actions` | Search available protocol actions across supported DeFi protocols. Call this first to discover actions and their parameters. Each result includes `protocolDirectExecution`; when true, use `execute_protocol_action`. When false, use the action-specific sibling tool (such as `execute_transfer` or `execute_contract_call`) or workflow execution. |
 | `execute_protocol_action` | Execute a DeFi protocol action. The `actionType` follows `protocol/action-slug` (for example `aave-v3/supply`). |
 
 ### AI Generation
@@ -305,7 +306,7 @@ and the authoritative safe first-write sequence.
 | Tool | Description |
 |------|-------------|
 | `list_integrations` | List configured integrations (credentials) for the organization. |
-| `get_wallet_integration` | Get details for a wallet integration, required for web3 write actions. |
+| `get_wallet_integration` | Get details for a wallet integration. Confirms the organization has a wallet configured; write action nodes never carry an integrationId of their own. |
 
 ### Documentation
 
@@ -414,6 +415,23 @@ Conditions reference previous node outputs using template syntax: `{{@nodeId:Lab
 
 The `network` field accepts chain IDs as strings: `"1"` (Ethereum mainnet), `"11155111"` (Sepolia), `"8453"` (Base), `"42161"` (Arbitrum), `"137"` (Polygon).
 
+### `web3Connection` field
+
+Write actions take an optional `web3Connection` that selects which of the
+organization's signers the transaction is sent from:
+
+| Value | Signer |
+|-------|--------|
+| omitted, `""`, or `"default"` | Organization policy for that chain: the configured Safe with its active role, the configured Safe owner-signed when no role is active, or the organization EOA when no Safe is active there. All three values are the same branch. |
+| `"eoa"` | The Turnkey EOA directly, bypassing the organization's Safe policy. |
+| `"safe:<safeWalletId>"` | A specific Safe belonging to the organization. |
+
+Leave it unset unless you intend to override organization policy for that
+node. There is no other per-node signer field: `integrationId` is a database
+integration id and is **not** read by any web3 step, so setting it on a
+`web3/*` node has no effect on which wallet signs. `validate_workflow` warns
+when it is present on a write node.
+
 ### `abiFunction` field
 
 For `web3/read-contract` and `web3/write-contract`, the `abiFunction` field is the function as it appears in the contract's ABI. Pass the plain name for unique functions (`"balanceOf"`) or the full signature for overloaded ones (`"transfer(address,uint256)"`).
@@ -442,10 +460,13 @@ A `400` from `execute_transfer`, `execute_contract_call`, or
 `execute_check_and_execute` with `simulate: true` is not always a bad request. Classify
 the body in this order:
 
-1. A string `code` together with `wouldRevert: true` is an attributed preflight failure. Currently
-   `insufficient_balance` means the simulated sender lacks the native value needed for
-   the call. This remains `failureKind: "validation"` because preflight did not produce
-   a decoded EVM revert.
+1. A string `code` together with `wouldRevert: true` is an attributed preflight failure. Attributed
+   codes are a closed set: `insufficient_balance` (native shortfall), `insufficient_allowance`, `insufficient_token_balance`,
+   `contract_paused`, `contract_not_paused`, `caller_not_authorized`, `reentrancy_blocked`, `role_condition_violation`,
+   `safe_signature_invalid`, `safe_insufficient_gas`, `safe_not_authorized`, and `panic` (with the exact panic number
+   in `panicCode`, for example `"0x11"`). `caller_not_authorized` is an on-chain revert, not the API auth code `unauthorized`.
+   A native shortfall remains `failureKind: "validation"` because preflight did not produce
+   a decoded EVM revert; true reverts carry `failureKind: "revert"`.
 2. Both `failureKind: "revert"` and `wouldRevert: true` mean the simulated call reverted.
 3. Other `failureKind: "validation"` bodies are deterministic simulation failures
    without an attributed code. They can reflect call construction or chain state, and

@@ -53,11 +53,11 @@ Two things this does **not** do: it does not price non-stablecoin ERC-20s, which
 This sequence is for `/api/execute/transfer`, `/api/execute/contract-call` and
 `/api/execute/check-and-execute` - the three endpoints that accept a `simulate`
 flag. **It does not apply to protocol actions or to `/api/execute/node`**,
-neither of which reads that flag: sent there, `"simulate": true` is ignored for
-dispatch, so step 2 signs and broadcasts a real transaction believing it is a
-dry run. The flag is still recorded as part of the execution's input, so
-reusing one `Idempotency-Key` across a `simulate: true` send and the same send
-with the flag removed returns `409 idempotency_conflict` rather than replaying.
+neither of which has a dry run. Both refuse the flag: `"simulate": true` in the
+request body, or inside `config` on `/api/execute/node`, is rejected with `400`
+and code `unsupported_param` before anything is reserved, signed or broadcast.
+`"simulate": false` is accepted, because it asks for the real execution those
+endpoints perform.
 
 A first write on those two endpoints has no dry run to put in step 2's place,
 so the pre-flight has to happen off this API:
@@ -92,7 +92,8 @@ you inspected is the transaction you send:
    retry sends the same one: see [Choosing a stable key](#choosing-a-stable-key).
 4. Save the returned `executionId`, then poll
    `GET /api/execute/{executionId}/status`. Honor the
-   `X-Poll-Interval-Hint` response header between polls.
+   `pollIntervalHint` JSON response body field (or `X-Poll-Interval-Hint`
+   response header) between polls.
 5. Treat the status response's `receipts` as the authoritative onchain proof:
    each entry is a receipt re-fetched from the chain, so `verified` and
    `receiptStatus` say what actually happened. `transactionHash` and
@@ -156,9 +157,43 @@ the request was received, so a retry must be able to match the original. Reusing
 key is what makes that retry safe: it returns the in-progress guard while the first
 request is still running, and the real outcome as a replay once it finishes.
 
-**Rotate to a new key** once the previous attempt returned a definite result. A
-stored failure is replayable for 24 hours, so a key that has already failed keeps
-returning that failure rather than retrying.
+**Reuse the same key after a failure the chain was conclusive about.** A
+transaction that reached the chain and reverted at inclusion releases the key:
+it landed, the chain gave a verdict, and nothing is still in flight. The same
+key simply executes again, so you no longer have to rotate to recover from that
+attempt.
+
+The send boundary preserves evidence instead of making the route guess from a
+missing RPC reply. Directly signed EVM transactions retain a deterministic hash
+once submission may have begun. Every broadcasting core also reports its boundary:
+`broadcastAttempted: false` means it proved the attempt stopped before submission;
+`true` means submission may have started. Missing evidence fails closed and keeps
+the key rather than treating a missing hash as proof that nothing was broadcast.
+
+Two consequences worth stating plainly, because they decide what your retry
+should do:
+
+- A write-core pre-broadcast rejection (for example `staticCall` or an in-core
+  balance check) is **released**. Validation 4xx responses also release, while
+  `simulate: true` reserves no idempotency record at all.
+- The mixed-chain `/api/execute/transfer` route keeps a hashless Solana failure
+  **held**. Solana send failures report attempted evidence where known, and any
+  missing evidence fails closed; absence of a signature is never treated as
+  proof that nothing reached the network.
+- A Safe transaction whose outer `execTransaction` mined while the inner call
+  reverted is **held**. The Safe's nonce and the owner signatures for it were
+  consumed, so "nothing landed" is not true even though the intended work did
+  not happen.
+
+**An outcome nobody could read keeps its key.** If the receipt was unreadable
+the transaction may still land, so that record is held and replays for 24 hours.
+The reply carries `"status": "unconfirmed"` and `"idempotentReplay": true`. Poll
+`GET /api/execute/{executionId}/status` rather than rotating, because a new key
+has no record to match and would broadcast a second transaction for work the
+first attempt may still be completing.
+
+**Rotate to a new key** when the work itself is different, not to escape a
+failure.
 
 **A conflict does not by itself mean rotate.** `retryable: false` says only that
 this body is not the body the key was bound to, and there are two reasons for
@@ -311,6 +346,72 @@ block explorer's `txlist` for that address — checks against the EOA will
 conclude nothing happened even though the transaction succeeded. Check the
 `sponsored` field on the status response and treat `transactionHash` /
 `transactionLink` as the authoritative proof, not EOA-level state.
+
+### Who acted
+
+On a sponsored execution the transaction's `from` is the sponsor's fee payer,
+not your wallet, and its `to` is the sponsor's entry contract, not the target.
+Your wallet acts inside that transaction. `result.executedCall.from` names it:
+the sender of the traced call frame that actually hit the target contract.
+
+A sponsored `approve` on Base Sepolia, as returned by
+`GET /api/execute/{executionId}/status` and trimmed to the relevant fields:
+
+```json
+{
+  "executionId": "4k4qm0kkjrkfc095jubo9",
+  "status": "completed",
+  "sponsored": true,
+  "result": {
+    "sponsored": true,
+    "executedCall": {
+      "contractAddress": "0x036cbd53842c5426634e7929541ec2318f3dcf7e",
+      "from": "0x742d35cc6634c0532925a3b844bc454e4438f44e",
+      "functionName": "approve",
+      "functionSignature": "approve(address,uint256)",
+      "args": { "spender": "0xd36E12a5b2926A5cbE6B4DE42a0D60Fd35d3cb04", "amount": "1" },
+      "sponsored": true,
+      "topLevelTo": "0x5af5194b4b0909eb978e3cf1e25333852277f07d",
+      "reverted": false
+    }
+  }
+}
+```
+
+Here the transaction was sent by the fee payer to `topLevelTo`, the sponsor's
+entry contract, which called the organization's wallet, which called `approve`
+on the token: `from` is that wallet, `0x742d...`, not the fee payer and not
+`topLevelTo`. The capture is a real Base Sepolia execution with the
+organization's wallet replaced by the placeholder used elsewhere on this page.
+`args` keys are the parameter names of the ABI the call was decoded with: the
+ABI supplied here named the second parameter `amount`; the platform's own
+ERC-20 ABI names it `value`.
+
+`from` is the sender of the first frame, in execution order, that called the
+target with the decoded function; the trace is walked depth-first, so that is
+the call that ran first, not the shallowest one. When your organization calls
+the target directly, which is every case above, that frame is the direct call,
+and the field is the acting address under every routing mode: your
+organization's wallet on a direct send, that same wallet when a sponsor paid the
+gas, and the Safe on a Safe-routed organization, where the wallet signs the
+outer transaction but `msg.sender` at the target is the Safe. If a contract the
+transaction calls reaches the target before your direct call does, the earlier
+frame is the one reported and `from` is that contract.
+
+One precision: `from` is the sender of the trace frame that hit the target,
+which is not always the Solidity-level `msg.sender`. When the target is called
+directly, which is every case above, the two are the same. If the address you
+passed as the target is an implementation reached by `DELEGATECALL`, `from` is
+the contract that issued the `DELEGATECALL` (the proxy), because that is what
+the trace frame records. The `msg.sender` seen inside the delegated code is a
+different value: it is inherited unchanged from the proxy's own caller, and is
+not what this field reports.
+
+`executedCall` is best-effort. It is omitted entirely when the transaction
+cannot be traced (an RPC without `debug_traceTransaction`, or no call frame
+matching the target), and `from` alone is omitted when the trace records no
+sender for the matched frame, so read both defensively rather than assuming
+they are there.
 
 ## Transfer Funds
 
@@ -535,6 +636,11 @@ Pass action parameters as a JSON object. `chainId` is required for every action
 (the legacy `network` field is accepted as a deprecated alias). Required fields
 for each action are defined in the protocol registry.
 
+Protocol actions have no dry run. A `simulate` field is rejected with `400` and
+code `unsupported_param` before anything is reserved or signed, except
+`"simulate": false`. To check a write before sending it, see
+[Safe First-Write Sequence](#safe-first-write-sequence).
+
 ### Response
 
 **Read actions** return the plugin result directly with HTTP `200`.
@@ -669,6 +775,150 @@ The request field is `condition` and the response field is `conditionResult`, on
 both the broadcast and the `simulate: true` paths. A parser written once against
 this endpoint works for both.
 
+## Gas Top-Up
+
+```http
+POST /api/execute/gas-top-up
+```
+
+Convert USDC in the organization's Turnkey wallet into native ETH on that same
+wallet. Gas sponsorship pays network fees only; it does not give the wallet
+spendable ETH. Use this route when the wallet holds USDC but needs native
+balance, for example for ETH value transfers, withdrawals, or writes that fall
+back to self-paid gas.
+
+This is not the pay-as-you-go billing top-up. Sending USDC to the organization
+wallet for billing pays for executions and KeeperHub covers gas; this route
+converts the wallet's own USDC into ETH that stays in the wallet.
+
+The route sends three gas-sponsored transactions from the organization's
+Turnkey EOA:
+
+1. `approve` exactly `amountUsdc` to Uniswap V3 SwapRouter02 (never unlimited).
+2. `exactInputSingle` USDC to WETH, with the wallet as recipient. A Uniswap
+   QuoterV2 `quoteExactInputSingle` call is taken before anything is sent, and
+   a zero or failed quote refuses the request. Once the approve confirms, the
+   quote is taken again, and the minimum output is that fresh quote less 0.5%,
+   set server-side. Each quote is also checked against the chain's Chainlink
+   ETH/USD price, which the pool cannot move: a quote more than 2% worse than
+   that price, or no fresh Chainlink price at all, refuses the request
+   (testnets skip this check). The swap goes through the router's `multicall`
+   with a deadline 3 minutes after that fresh quote, so a swap left in the
+   mempool past that reverts instead of filling at a stale price. If the second
+   quote fails or fails the Chainlink check, the swap is not sent and no USDC
+   is spent. Whenever the swap does not happen after the approve confirmed
+   (not sent, declined, or reverted), the route sends `approve` of `0` to the
+   router so no allowance is left behind.
+3. `withdraw` on WETH for the amount the swap delivered, read from the swap's
+   own receipt, which pays native ETH to the wallet. WETH the wallet already
+   held is left alone.
+
+Requires `mcp:write`. There is no dry-run mode: `simulate` is refused.
+
+### Request Body
+
+```json
+{
+  "chainId": 8453,
+  "amountUsdc": "5"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `chainId` | number or numeric string | `1` (Ethereum), `8453` (Base), `42161` (Arbitrum), or `11155111` (Sepolia) |
+| `amountUsdc` | string | USDC to convert, positive, at most 6 decimal places |
+
+Any other field is rejected with `400`. There is no recipient parameter (the
+ETH always lands in the wallet that paid the USDC) and no slippage parameter.
+
+### Limits and refusals
+
+Checked before an execution is reserved or anything is sent:
+
+| Status | When |
+|---|---|
+| `400` | Unsupported chain, invalid amount, unknown field, or `simulate` present |
+| `403` | Organization circuit breaker engaged |
+| `403` | `amountUsdc` above the per-call stablecoin cap (100 USD by default) |
+| `403` | `amountUsdc` would take the organization past its daily gas top-up limit (200 USD per UTC day by default). The error gives the amount used today, the amount requested, and the limit |
+| `422` | Gas sponsorship unavailable: not enabled on the chain, credits exhausted, or no Turnkey wallet. The route never falls back to self-paid gas |
+| `422` | `WALLET_NOT_CONFIGURED`, or the chain's canonical USDC is not a supported stablecoin |
+
+An insufficient USDC balance, a failed quote, or a first quote that fails the
+Chainlink price check (or finds no fresh Chainlink price) is reported after the
+execution is reserved, as `202` with `status: "failed"` and no transaction sent.
+
+The daily limit counts a finished top-up, whatever its status, when its swap
+landed (its USDC is spent), and a completed or unconfirmed top-up whose swap was
+broadcast and may still land. A top-up that stopped before its swap, or whose
+swap reverted, does not count. Top-ups still in flight count too, for the rest
+of the UTC day however long they take, so a slow or
+interrupted run never frees its share early. It is checked twice: once before
+the wallet and sponsorship are resolved, so a request over a spent budget is
+refused without that work, and again atomically with the reservation, so
+concurrent requests cannot both fit under the last of the day's allowance. A
+retry with the same `Idempotency-Key` replays the stored result even once the
+limit is reached. Self-hosted deployments can change it with
+`EXECUTE_DEFAULT_DAILY_GAS_TOP_UP_CAP_MICRO_USD` (micro-USD, so `200000000` is
+200 USD).
+
+### Response
+
+```json
+{
+  "executionId": "k72596auc9fwidsvm8jxu",
+  "status": "completed",
+  "chainId": 8453,
+  "wallet": "0x742d35cc6634c0532925a3b844bc454e4438f44e",
+  "transactionHash": "0x...",
+  "transactionLink": "https://basescan.org/tx/0x...",
+  "steps": [
+    { "name": "approve", "status": "confirmed", "transactionHash": "0x..." },
+    { "name": "swap", "status": "confirmed", "transactionHash": "0x..." },
+    { "name": "unwrap", "status": "confirmed", "transactionHash": "0x..." }
+  ],
+  "usdcSpent": "5",
+  "wethReceived": "0.0019",
+  "ethReceived": "0.0019",
+  "quotedWethOut": "1909500000000000",
+  "amountOutMinimum": "1899952500000000",
+  "sponsored": true
+}
+```
+
+`transactionHash` is the unwrap transaction on success. `quotedWethOut` and
+`amountOutMinimum` are in wei.
+
+If the swap's receipt still cannot be read after a few seconds of retries, the
+route unwraps `amountOutMinimum`,
+which the swap is guaranteed to have delivered, and the response carries a
+`warning`: any WETH above that minimum stays in the wallet. Unwrap it with the
+`wrapped/unwrap` protocol action.
+
+### Partial completion
+
+The three transactions are separate, so a run can stop after one or two. The
+response says which landed: each entry in `steps` is `confirmed`, `failed`, or
+`skipped`. `error` explains what state the wallet is left in:
+
+- Approve failed: no USDC was spent.
+- Swap failed: no USDC was spent, and the route sets the approval back to
+  zero. `approvalRevoked` is `true` once that confirmed, with
+  `revokeTransactionHash` and `revokeTransactionLink`. It is `false` when the
+  reset did not complete, in which case an approval for exactly `amountUsdc`
+  remains; revoke it with an `approve` of `0` to the router. A swap that is
+  still unconfirmed is never revoked, since it needs the approval to land.
+- Swap broadcast but unconfirmed: the USDC may or may not have been spent.
+  `usdcSpent` is omitted and `swapPending` is `true`.
+- Unwrap failed: the USDC is spent and the WETH is left unwrapped in the
+  wallet. `usdcSpent` and `wethReceived` are set, `ethReceived` is not.
+
+Once the swap has confirmed, a retry with the same `Idempotency-Key` replays the
+stored result rather than swapping again. Do not call again with a new key to
+finish a partial run: the USDC is already spent. Unwrap the remaining WETH with
+the `wrapped/unwrap` protocol action instead.
+
 ## Dry-Run Simulation
 
 All three execute endpoints (`/api/execute/transfer`, `/api/execute/contract-call`, `/api/execute/check-and-execute`) accept a `simulate` flag on the body. When set to boolean `true`, the endpoint validates inputs, resolves the org's from-address, encodes the call, and runs `provider.estimateGas` + `provider.call` against the chain — **without** signing or broadcasting a transaction.
@@ -677,7 +927,7 @@ No row is inserted into the execution audit table, no funds are reserved against
 
 A deterministic failed simulation answers with HTTP `400`. Do not classify every such body as an EVM
 revert: read a string `code` first, then `failureKind`, then `wouldRevert`. A `code` is an
-attributed preflight failure such as `insufficient_balance`; `failureKind: "revert"`
+attributed preflight failure such as `insufficient_balance` or `insufficient_allowance`; `failureKind: "revert"`
 with `wouldRevert: true` is a confirmed call revert; an uncoded
 `failureKind: "validation"` is not. Route-level parameter errors may carry none of these
 fields. This ordering keeps a generic "non-2xx means the request is malformed" wrapper
@@ -700,7 +950,7 @@ Add `"simulate": true` to any of the standard request bodies:
 }
 ```
 
-`simulate` must be a strict boolean — `true` or `false`. Strings (`"true"`), numbers (`1`), and other non-boolean values are rejected with HTTP 400 to prevent silent fall-through to a real broadcast. There is no query-string form; the body field is the only way to request a dry run.
+`simulate` must be a strict boolean — `true` or `false`. Strings (`"true"`), numbers (`1`), and other non-boolean values are rejected with HTTP 400 to prevent silent fall-through to a real broadcast. The top-level body field is the only way to request a dry run. There is no query-string form: a `simulate` query parameter, in any letter case, is rejected with `400` and code `unsupported_param` on every `/api/execute/*` endpoint. The one exception is `?simulate=false`, which asks for nothing the endpoint would not already do.
 
 Because a dry run never signs or broadcasts, a credential scoped `mcp:read` may run one. Removing `simulate` to broadcast requires `mcp:write`.
 
@@ -800,7 +1050,7 @@ over the ceiling would fail at send and must not dry-run clean.
   not the transfer recipient
 - `value`: native value in wei sent with the call
 - `gasEstimate`: estimated gas units required by the call, as a decimal string
-- `simulatedReturnValue`: the decoded return value of the call (e.g. `true` for ERC-20 `transfer`, the read value for view functions, `null` for native transfers to an EOA recipient)
+- `simulatedReturnValue`: the decoded return value of the call (e.g. `true` for ERC-20 `transfer`, the read value for view functions, `null` for native transfers to an EOA recipient). A non-standard token that returns no data on `transfer` (the USDT pattern) also simulates successfully with `simulatedReturnValue: null` — the simulator treats an empty return the same as a native transfer to an EOA, not as a failure.
 - `wouldRevert`: always `false` on this path
 
 ### Response — would-revert
@@ -854,7 +1104,18 @@ A node asked to estimate gas for a transfer the sender cannot pay for rejects it
 
 - `failureKind`: `"validation"` here means no EVM revert was decoded. It does not mean
   the request data is malformed; inspect `code` before interpreting this discriminator
-- `code`: `"insufficient_balance"` — branch on this rather than string-matching `revertReason`. Absent when the simulator has no more specific machine-readable cause
+- `code`: machine-readable cause — branch on this rather than string-matching `revertReason`. Absent when the simulator has no more specific machine-readable cause. The set is closed:
+  - `insufficient_balance`: the funding wallet cannot cover the native value the call sends
+  - `insufficient_allowance`: current ERC-20 allowance is less than needed. When the token reverts with `ERC20InsufficientAllowance`, the response also carries `allowance`, `neededAllowance` and `spender`
+  - `insufficient_token_balance`: sender ERC-20 token balance is less than the transfer amount
+  - `contract_paused`: target contract is paused (`EnforcedPause`, `Pausable: paused`)
+  - `contract_not_paused`: operation requires target contract to be paused, but it is currently unpaused (`ExpectedPause`)
+  - `caller_not_authorized`: the simulated sender is not the owner or lacks the required role (`OwnableUnauthorizedAccount`, `AccessControlUnauthorizedAccount`). This is an on-chain revert, distinct from the API auth code `unauthorized`
+  - `reentrancy_blocked`: reentrancy guard triggered
+  - `safe_signature_invalid`, `safe_insufficient_gas`, `safe_not_authorized`: Safe execution failures
+  - `role_condition_violation`: Zodiac Roles modifier condition failed
+  - `panic`: the contract hit a Solidity `Panic(uint256)`. `panicCode` carries the exact panic number as a hex string (for example `"0x11"` for arithmetic overflow), and `revertReason` carries the readable name
+- `remediation`: set alongside a decoded-revert `code`. A plain-English diagnosis of what is wrong, with the numbers and addresses behind it. It may point at request inputs you control (amount, arguments, gas limit, signer mode); it never tells you to make an on-chain call
 - `balanceWei` / `requiredWei` / `shortfallWei`: the sender's native balance, the native value the call would move, and the difference, all in wei
 - `nativeSymbol`: the chain's native currency symbol (`ETH`, `BNB`, `POL`); falls back to `native` if the chain is not seeded
 - `originalError`: the node's own message, kept verbatim. Attribution only ever adds — nothing the chain said is discarded
@@ -871,7 +1132,7 @@ For ERC-20 transfers, `decimals` is optional — when omitted, the simulator loo
 
 ### check-and-execute specifics
 
-`simulate: true` still evaluates the condition (which is read-only) and only swaps the **action's** write for a simulated call. The response wraps the simulate body in the existing `{ executed, conditionResult }` envelope:
+`simulate: true` still evaluates the condition (which is read-only) and only swaps the **action's** write for a simulated call. The flag goes at the top level of the body, not inside `action`: `action.simulate` is rejected with `400` (code `unsupported_param`, field `action.simulate`) rather than ignored, except `"simulate": false`. The response wraps the simulate body in the existing `{ executed, conditionResult }` envelope:
 
 ```json
 {
@@ -919,7 +1180,7 @@ return `{ executed, conditionResult }` exactly as before.
 
 The `from` address used during simulation is the org's wallet (`getOrganizationWalletAddress`). Organizations that route writes through a Safe will see a simulation that reflects the EOA sending the call, not the Safe. Most config-bug categories (bad ABI, bad args, allowance mismatches) still surface; Safe-routed `msg.sender` semantics do not.
 
-This also applies to the underfunded-sender response above. The balance is read from `from`, but a Safe-routed org funds the transfer from the Safe, so `code`, `balanceWei`, `shortfallWei` and the "Fund `<address>`" sentence describe the EOA rather than the address the broadcast actually spends from. If your organization routes writes through a Safe, do not act on those fields without resolving the signer mode first.
+This also applies to the underfunded-sender response above. The balance is read from `from`, but a Safe-routed org funds the transfer from the Safe, so `code`, `balanceWei`, `shortfallWei` and the "Fund `<address>`" sentence describe the EOA rather than the address the broadcast actually spends from. The same holds for the decoded-revert codes `insufficient_token_balance`, `insufficient_allowance` and `caller_not_authorized`, and for their `remediation`: the token balance, the allowance owner and the caller they describe are the EOA, not the Safe. If your organization routes writes through a Safe, do not act on those fields without resolving the signer mode first.
 
 ## Get Execution Status
 
@@ -935,6 +1196,7 @@ Check the status of a direct execution.
 {
   "executionId": "n3364uzl2s6aram5v558c",
   "status": "completed",
+  "pollIntervalHint": 0,
   "type": "transfer",
   "network": "11155111",
   "transactionHash": "0x...",
@@ -964,6 +1226,11 @@ Check the status of a direct execution.
 
 **Other fields:**
 
+- `pollIntervalHint`: recommended seconds to wait before the next poll, or `0`
+  when the execution has reached a terminal state (`completed` or `failed`).
+  Identical to the `X-Poll-Interval-Hint` header, surfaced in the JSON body so
+  MCP tools and clients without header access can decide terminality safely.
+
 - `network`: the chain identifier the request supplied, stored verbatim as a
   string. The form is decided by the value, not by the field: both `chainId`
   and the deprecated `network` alias accept a numeric chain ID or a known chain
@@ -991,6 +1258,17 @@ Check the status of a direct execution.
   timeout: it is abandoned rather than cancelled, so nothing comes back to
   carry a hash, and a per-attempt timeout shorter than the chain's confirmation
   latency can leave two transactions confirmed.
+
+  That endpoint's `retry` object takes `maxRetries` (0 to 10) and `timeoutMs`
+  (1000 to 600000). **`maxRetries` defaults to 3, so an omitted value is four
+  attempts, not one**, and the worst-case budget - `timeoutMs` times attempts -
+  may not exceed 600000ms, the idempotency processing-lock TTL. A request that
+  exceeds it is rejected with a 400 naming the arithmetic that was applied.
+  Omitting `maxRetries` therefore admits a `timeoutMs` up to 150000; past that,
+  send `maxRetries: 0` to keep a single long attempt. Lowering `timeoutMs` is
+  the wrong way to fit the budget for a write: per the paragraph above, a
+  per-attempt timeout under the chain's confirmation latency is what produces
+  two confirmed transactions.
 - `gasPriceWei`: the effective gas price, as a decimal string. On EVM chains
   this is in wei. On Solana it is the micro-lamports-per-compute-unit price of
   the priority component, as described in
@@ -1038,15 +1316,20 @@ Treat this list as a lower bound rather than a closed set. A client that routes 
 unrecognised status into a failing `default` branch will report a failure for an
 execution that is still settling, and one that responds by retrying with a new
 idempotency key can put a second transaction onchain. Decide terminality from the
-`X-Poll-Interval-Hint` response header rather than from the status string: the
-server computes it from its own terminal set, so it stays correct for statuses
-added after your client shipped. `0` means terminal.
+`pollIntervalHint` response body field (or the `X-Poll-Interval-Hint` response
+header) rather than from the status string: the server computes it from its own
+terminal set, so it stays correct for statuses added after your client shipped.
+`0` means terminal.
 
 `sponsored` is `true` when the write was gas-sponsored and broadcast through
 a relayer or smart-account path rather than your org's EOA wallet — see
 [Sponsored Executions](#sponsored-executions).
 
-When polling this endpoint, honour the `X-Poll-Interval-Hint` response header instead of polling on a fixed timer: it gives the recommended number of seconds to wait before the next poll. A value of `0` means the execution has reached a terminal state (`completed` or `failed`) and you can stop polling.
+When polling this endpoint, honour the `pollIntervalHint` response body field
+(or the `X-Poll-Interval-Hint` response header) instead of polling on a fixed
+timer: it gives the recommended number of seconds to wait before the next poll.
+A value of `0` means the execution has reached a terminal state (`completed` or
+`failed`) and you can stop polling.
 
 ## Error Responses
 
@@ -1066,7 +1349,7 @@ Direct execution endpoints return detailed error information:
 - `403`: The daily spending cap is exceeded, or the credential lacks the scope the request needs (`insufficient_scope`). Scope is enforced for both OAuth tokens and organization API keys. A key created without a scope has no scope restriction and passes every gate. See [Spending Caps](#spending-caps) — an organization that never configured a cap is still subject to the platform default.
 - `422`: Wallet not configured, code `WALLET_NOT_CONFIGURED` (see [Wallet Management](/wallet-management/turnkey))
 - `429`: Rate limit exceeded
-- `400`: Invalid request parameters
+- `400`: Invalid request parameters. A `simulate` flag sent where the endpoint does not read it returns code `unsupported_param`, with `field` naming where it was found (`simulate`, `config.simulate` or `action.simulate`); see [Dry-Run Simulation](#dry-run-simulation)
 
 An `insufficient_scope` response names the scope the endpoint needs and the one
 this connection is allowed:
@@ -1104,8 +1387,12 @@ The simulation is advisory and never blocks execution. Reverts, funding shortfal
 
 Only write nodes reachable from a trigger are simulated. Disconnected write nodes are ignored.
 
-Each write is simulated independently against the current chain state. A later write may appear to revert when it depends on an earlier workflow step whose state change has not yet been applied. Later-write warnings therefore state that the result may depend on an earlier step in the workflow.
+Consecutive Write Contract nodes on one chain along one path are simulated as a sequence, each against the state the node before it produced, so an approve followed by a deposit is judged as it will actually run rather than warning on allowance because the approve has not landed. The nodes are taken in the order the edges connect them, not the order they were saved. The state is carried by `eth_simulateV1` where the chain's node offers it and by trace-derived `eth_call` overrides where it does not. If the sequence cannot be answered at all, because the chain's node offers neither mechanism or the RPC is unavailable, each node of the run is simulated on its own against current chain state instead, so no node loses the result it would have had before sequencing existed. A run holds at most ten nodes, the same limit as `calls` on the direct-execution sequence endpoint; an eleventh consecutive write starts a new run.
 
-The endpoint is protected by rate limiting, a maximum of 50 workflow nodes, and a 15-second simulation deadline.
+A node that cannot join such a run is simulated on its own against current chain state: a write with more than one incoming connection, the second branch of a fan-out (the branch the connections reach first continues the run, unless it carries no write at all), a write on a different chain from the one before it, a write whose inputs use runtime templates, a write that sends native value (only the single-call path can report a funding shortfall with the amount), the first write past the ten-node limit, and native and token transfers. A warning on such a node may depend on an earlier workflow step whose state change has not been applied, and says so. A warning on a node simulated within a sequence drops that hedge only when no other reachable write ran before the sequence started and every earlier call in the sequence landed. Every reachable node that changes chain state counts as such a write, including the ones this preflight does not simulate (Approve Token, Batch Write Contract, protocol writes and Tempo writes), so a run that begins after any of them, or after a transfer, keeps the hedge, because the sequence applied the run alone; and so does a node whose earlier call in the run reverted, because a reverted call applies no state.
+
+Warnings are returned in the order the nodes would run, following the connections from the trigger, rather than in the order the nodes are stored. Each warning still carries the node id and a `parameterPath` into the stored `nodes` array.
+
+The endpoint is protected by rate limiting, a maximum of 50 workflow nodes, a 15-second simulation deadline, and a ten-call bound on each simulated sequence. A preflight that overruns the deadline answers `503` with `error: "SIMULATION_TIMEOUT"` and no warnings at all, rather than a partial set; on the state-override mechanism a sequence costs three requests per call where a single node costs two, so a long run on a chain without `eth_simulateV1` is the case most likely to reach it.
 
 The preflight does not sign or broadcast transactions, create execution records, reserve spending limits, or perform billing operations.

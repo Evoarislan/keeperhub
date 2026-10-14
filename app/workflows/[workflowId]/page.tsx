@@ -25,11 +25,13 @@ import {
   getPendingClaim,
   useClaimWorkflow,
 } from "@/lib/hooks/use-claim-workflow";
+import { SYSTEM_ACTION_INTEGRATIONS } from "@/lib/integrations/system";
 import {
   integrationsAtom,
   integrationsLoadedAtom,
   integrationsVersionAtom,
 } from "@/lib/integrations-store";
+import { refetchSidebar } from "@/lib/refetch-sidebar";
 import type { IntegrationType } from "@/lib/types/integration";
 import { editorSurface } from "@/lib/workflow/editor/editor-surface";
 import {
@@ -81,11 +83,6 @@ type WorkflowPageProps = {
 
 type WorkflowEditorProps = {
   workflowId: string;
-};
-
-// System actions that need integrations (not in plugin registry)
-const SYSTEM_ACTION_INTEGRATIONS: Record<string, IntegrationType> = {
-  "Database Query": "database",
 };
 
 // Helper to get required integration type for an action
@@ -772,7 +769,10 @@ const WorkflowEditor = ({ workflowId }: WorkflowEditorProps) => {
 
     const rehydrate = async (): Promise<void> => {
       try {
-        const executions = await api.workflow.getExecutions(currentWorkflowId);
+        const { executions } = await api.workflow.getExecutions(
+          currentWorkflowId,
+          { limit: 50 }
+        );
         if (cancelled) {
           return;
         }
@@ -1108,6 +1108,7 @@ const WorkflowEditor = ({ workflowId }: WorkflowEditorProps) => {
                         },
                       ],
                     });
+                    refetchSidebar({ workflowCreated: true });
                     router.replace(`/workflows/${newWorkflow.id}`);
                   } catch (error) {
                     console.error("Failed to create workflow:", error);

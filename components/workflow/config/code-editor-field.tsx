@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback } from "react";
-import { TemplateCodeEditor } from "@/components/ui/template-code-editor";
+import { TemplateCodeEditor } from "@/components/workflow/config/template-code-editor";
 
 type CodeEditorFieldProps = {
   value: string;
@@ -10,6 +10,8 @@ type CodeEditorFieldProps = {
   placeholder?: string;
   language?: string;
   height?: string;
+  /** Names the field in the full-screen dialog. */
+  label?: string;
 };
 
 export function CodeEditorField({
@@ -19,6 +21,7 @@ export function CodeEditorField({
   placeholder,
   language = "javascript",
   height = "320px",
+  label,
 }: CodeEditorFieldProps): React.ReactElement {
   const handleChange = useCallback(
     (newValue: string): void => {
@@ -31,6 +34,7 @@ export function CodeEditorField({
     <TemplateCodeEditor
       disabled={disabled}
       height={height}
+      label={label}
       language={language}
       onChange={handleChange}
       placeholder={placeholder}

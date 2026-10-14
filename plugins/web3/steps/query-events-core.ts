@@ -5,6 +5,54 @@ import { getErrorMessage } from "@/lib/utils";
 
 export type AbiEntry = { type: string; name: string };
 
+// Blocks per eth_getLogs call, to stay within RPC provider range limits.
+export const QUERY_BATCH_SIZE = 2000;
+
+export type DecodedEvent = {
+  blockNumber: number;
+  transactionHash: string;
+  logIndex: number;
+  args: Record<string, unknown>;
+};
+
+function serializeBigInts(value: unknown): unknown {
+  return JSON.parse(
+    JSON.stringify(value, (_, v) => (typeof v === "bigint" ? v.toString() : v))
+  );
+}
+
+export function decodeEventArgs(
+  values: ethers.Result,
+  eventFragment: ethers.EventFragment
+): Record<string, unknown> {
+  const args: Record<string, unknown> = {};
+  for (const [index, input] of eventFragment.inputs.entries()) {
+    const name = input.name || `arg${index}`;
+    args[name] = serializeBigInts(values[index]);
+  }
+  return args;
+}
+
+export function parseAbi(
+  abi: unknown
+): { success: true; parsed: AbiEntry[] } | { success: false; error: string } {
+  let parsedAbi: unknown;
+  try {
+    parsedAbi = JSON.parse(String(abi));
+  } catch (error) {
+    return {
+      success: false,
+      error: `Invalid ABI JSON: ${getErrorMessage(error)}`,
+    };
+  }
+
+  if (!Array.isArray(parsedAbi)) {
+    return { success: false, error: "ABI must be a JSON array" };
+  }
+
+  return { success: true, parsed: parsedAbi as AbiEntry[] };
+}
+
 export type BatchQueryResult = {
   events: (ethers.Log | ethers.EventLog)[];
   // The block actually scanned up to. Equal to the requested `end` for a
@@ -45,10 +93,18 @@ export function isNearHeadBatch(
   return toBlockIsLatest && toBlock - batchEnd < TIP_SAFETY_MARGIN_BLOCKS;
 }
 
+// The topic array an argument filter compiles to, or null for "every
+// occurrence of this event" -- see event-arg-filter-core.ts.
+export type EventTopicFilter = (string | null)[] | null;
+
 function resolveEventFilter(
   contract: ethers.Contract,
-  eventName: string
-): ethers.DeferredTopicFilter {
+  eventName: string,
+  topics: EventTopicFilter
+): ethers.DeferredTopicFilter | (string | null)[] {
+  if (topics) {
+    return topics;
+  }
   const eventFilter = contract.filters[eventName]?.();
   if (eventFilter === undefined || eventFilter === null) {
     throw new Error(`Could not create filter for event '${eventName}'`);
@@ -62,10 +118,11 @@ async function fetchFixedBatch(
   parsedAbi: AbiEntry[],
   eventName: string,
   start: number,
-  end: number
+  end: number,
+  topics: EventTopicFilter
 ): Promise<BatchQueryResult> {
   const contract = new ethers.Contract(contractAddress, parsedAbi, provider);
-  const eventFilter = resolveEventFilter(contract, eventName);
+  const eventFilter = resolveEventFilter(contract, eventName, topics);
   const events = await contract.queryFilter(eventFilter, start, end);
   return { events, actualEnd: end };
 }
@@ -93,10 +150,11 @@ async function fetchTipBatch(
   contractAddress: string,
   parsedAbi: AbiEntry[],
   eventName: string,
-  start: number
+  start: number,
+  topics: EventTopicFilter
 ): Promise<BatchQueryResult> {
   const contract = new ethers.Contract(contractAddress, parsedAbi, provider);
-  const eventFilter = resolveEventFilter(contract, eventName);
+  const eventFilter = resolveEventFilter(contract, eventName, topics);
   const events = await contract.queryFilter(eventFilter, start, "latest");
 
   const actualEnd = events.reduce(
@@ -105,6 +163,29 @@ async function fetchTipBatch(
   );
 
   return { events, actualEnd };
+}
+
+async function withBatchRetry<T>(
+  start: number,
+  end: number,
+  run: () => Promise<T>
+): Promise<T> {
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= MAX_BATCH_RETRIES; attempt++) {
+    try {
+      return await run();
+    } catch (error) {
+      lastError = error;
+      console.log(
+        `[Query Events] Batch ${start}-${end} failed (attempt ${attempt}/${MAX_BATCH_RETRIES}): ${getErrorMessage(error)}`
+      );
+      if (attempt < MAX_BATCH_RETRIES) {
+        await sleep(RETRY_BASE_DELAY_MS * attempt);
+      }
+    }
+  }
+  throw lastError;
 }
 
 // Query a single block range, failing over between RPC endpoints AND retrying
@@ -117,40 +198,61 @@ async function fetchTipBatch(
 // queries against "latest" directly; an explicit user-provided toBlock is
 // always queried as a fixed number, so a real user misconfiguration still
 // surfaces as an error instead of being silently reinterpreted.
-export async function queryBatchWithRetry(
+export function queryBatchWithRetry(
   rpcManager: RpcProviderManager,
   contractAddress: string,
   parsedAbi: AbiEntry[],
   eventName: string,
   start: number,
   end: number,
-  isTipBatch: boolean
+  isTipBatch: boolean,
+  topics: EventTopicFilter = null
 ): Promise<BatchQueryResult> {
-  let lastError: unknown;
+  return withBatchRetry(start, end, () =>
+    rpcManager.executeWithFailover((provider) =>
+      isTipBatch
+        ? fetchTipBatch(
+            provider,
+            contractAddress,
+            parsedAbi,
+            eventName,
+            start,
+            topics
+          )
+        : fetchFixedBatch(
+            provider,
+            contractAddress,
+            parsedAbi,
+            eventName,
+            start,
+            end,
+            topics
+          )
+    )
+  );
+}
 
-  for (let attempt = 1; attempt <= MAX_BATCH_RETRIES; attempt++) {
-    try {
-      return await rpcManager.executeWithFailover((provider) =>
-        isTipBatch
-          ? fetchTipBatch(provider, contractAddress, parsedAbi, eventName, start)
-          : fetchFixedBatch(
-              provider,
-              contractAddress,
-              parsedAbi,
-              eventName,
-              start,
-              end
-            )
-      );
-    } catch (error) {
-      lastError = error;
-      console.log(
-        `[Query Events] Batch ${start}-${end} failed (attempt ${attempt}/${MAX_BATCH_RETRIES}): ${getErrorMessage(error)}`
-      );
-      if (attempt < MAX_BATCH_RETRIES) {
-        await sleep(RETRY_BASE_DELAY_MS * attempt);
-      }
-    }
-  }
-  throw lastError;
+// An address list and a topic array whose positions may each hold an OR-list.
+export type LogQueryFilter = {
+  addresses: string[];
+  topics: (string | string[] | null)[];
+};
+
+// The same failover and retry for one fixed-range eth_getLogs call.
+export function queryLogsWithRetry(
+  rpcManager: RpcProviderManager,
+  filter: LogQueryFilter,
+  start: number,
+  end: number
+): Promise<ethers.Log[]> {
+  return withBatchRetry(start, end, () =>
+    rpcManager.executeWithFailover((provider) =>
+      provider.getLogs({
+        address: filter.addresses,
+        topics: filter.topics,
+        fromBlock: start,
+        toBlock: end,
+      })
+    )
+  );
 }

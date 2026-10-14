@@ -312,6 +312,12 @@ app:
     EXECUTE_DEFAULT_BATCH_STABLECOIN_CAP_MICRO_USD:
       type: kv
       value: "2000000000"
+    # Daily total of USDC an org can convert to native gas through
+    # /api/execute/gas-top-up, in micro-USD. Sits beside the per-call figure,
+    # which bounds each top-up; this bounds the day. 200 USD.
+    EXECUTE_DEFAULT_DAILY_GAS_TOP_UP_CAP_MICRO_USD:
+      type: kv
+      value: "200000000"
     METRICS_COLLECTOR:
       type: kv
       value: "prometheus"
@@ -961,8 +967,13 @@ app:
         concurrencyPolicy: Forbid
         successfulJobsHistoryLimit: 3
         failedJobsHistoryLimit: 3
-        restartPolicy: OnFailure
-        backoffLimit: 2
+        # No retries. A failed run already did its whole budget of work, and
+        # the next scheduled run resumes from the watermarks, so a retry only
+        # repeats that load on a day something is already wrong. Quoted on
+        # purpose: the chart renders `backoffLimit | default "6"`, and `default`
+        # treats a numeric 0 as empty, so an unquoted 0 would deploy as 6.
+        restartPolicy: Never
+        backoffLimit: "0"
 
 executor:
   enabled: true
@@ -1111,6 +1122,12 @@ executor:
     EXECUTE_DEFAULT_BATCH_STABLECOIN_CAP_MICRO_USD:
       type: kv
       value: "2000000000"
+    # Daily total of USDC an org can convert to native gas through
+    # /api/execute/gas-top-up, in micro-USD. Sits beside the per-call figure,
+    # which bounds each top-up; this bounds the day. 200 USD.
+    EXECUTE_DEFAULT_DAILY_GAS_TOP_UP_CAP_MICRO_USD:
+      type: kv
+      value: "200000000"
     JOB_TTL_SECONDS:
       type: kv
       value: "120"

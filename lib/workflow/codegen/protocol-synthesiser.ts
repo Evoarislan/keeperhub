@@ -1,5 +1,6 @@
 import { getEncodeTransformKind } from "@/lib/protocol-encode-transforms";
 import type { ProtocolActionInput } from "@/lib/protocol-registry";
+import { ZERO_ADDRESS } from "@/lib/web3/address";
 import {
   type AbiFunctionFragment,
   type AbiParameter,
@@ -71,21 +72,17 @@ function camelCaseSlug(slug: string): string {
 
 // -- Chain & address resolution ----------------------------------------------
 
-function resolveChain(
-  ctx: ProtocolActionContext,
-  nodeConfig: Record<string, unknown> | undefined
-): ResolvedChain {
-  const chainId = nodeConfig?.network as string | undefined;
+function resolveChain(chainId: string | undefined): ResolvedChain {
   if (!chainId) {
     return { kind: "missing" };
   }
   const entry = VIEM_CHAINS[chainId];
+  // "unknown" means unknown to viem, and nothing else. Whether the contract
+  // has an address on this chain is resolveAddress's question, and it already
+  // answers it with "no deployment recorded for chain id N". Folding the two
+  // together made a node on Base emit "chain id 8453 is not in viem/chains",
+  // which is false and sends the reader to define a chain viem ships.
   if (!entry) {
-    return { kind: "unknown", chainId };
-  }
-  if (
-    !(ctx.contract.userSpecifiedAddress || chainId in ctx.contract.addresses)
-  ) {
     return { kind: "unknown", chainId };
   }
   return { kind: "known", chainId, entry };
@@ -178,6 +175,12 @@ function buildInputType(ctx: ProtocolActionContext): string {
   }
   const lines: string[] = ["type Input = {"];
   for (const inp of ctx.action.inputs) {
+    // A payer input is never caller-supplied: the write template emits
+    // the signing account's address for its arg, so the generated Input
+    // type carries no field for it.
+    if (inp.payer) {
+      continue;
+    }
     const annotation = decimalsAnnotation(inp.decimals);
     if (annotation) {
       lines.push(annotation);
@@ -199,9 +202,16 @@ function applyEncodeTransform(
   ctx: ProtocolActionContext,
   fieldName: string
 ): string {
+  // `ctx.action.slug`, not `ctx.actionSlug`: a transform is registered against
+  // the action that declares the input, and the runtime looks it up with the
+  // slug of the action it resolved (protocol-read.ts and
+  // protocol-write.ts both find the action by function + contract key, then
+  // pass its slug to applyEncodeTransformsNamed). For an aliased slug the two
+  // differ, and keying off the requested one would emit SDK source that
+  // encodes an argument differently from the step.
   const kind = getEncodeTransformKind(
     ctx.protocolSlug,
-    ctx.actionSlug,
+    ctx.action.slug,
     fieldName
   );
   if (!kind) {
@@ -232,7 +242,7 @@ function applyEncodeTransform(
     // and it would move the SDK and the runtime together rather than only
     // the SDK.
     throw new Error(
-      `The weiToEther transform reached the SDK args builder for "${ctx.protocolSlug}/${ctx.actionSlug}/${fieldName}". That kind is only valid on the virtual ethValue field, which never reaches this builder, so the registration guard in lib/protocol-encode-transforms.ts has been removed or bypassed.`
+      `The weiToEther transform reached the SDK args builder for "${ctx.protocolSlug}/${ctx.action.slug}/${fieldName}". That kind is only valid on the virtual ethValue field, which never reaches this builder, so the registration guard in lib/protocol-encode-transforms.ts has been removed or bypassed.`
     );
   }
   // Exhaustive over EncodeTransformKind, enforced at compile time: adding a
@@ -297,8 +307,16 @@ function buildArgExpression(
 }
 
 function buildArgsList(ctx: ProtocolActionContext): string {
+  // A payer input's arg is the account paying for the call, not anything
+  // the caller supplied - the write template's `account` is declared
+  // before the simulation reads this list.
+  const payerNames = new Set(
+    ctx.action.inputs.filter((i) => i.payer).map((i) => i.name)
+  );
   const parts = ctx.abiFragment.inputs.map((p) =>
-    buildArgExpression(p, "input", ctx, true)
+    payerNames.has(p.name ?? "")
+      ? "account.address"
+      : buildArgExpression(p, "input", ctx, true)
   );
   return parts.join(", ");
 }
@@ -444,8 +462,6 @@ function emitChainImport(chain: ResolvedChain): {
     ],
   };
 }
-
-const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 
 function addressBlock(value: string): string {
   return `const CONTRACT_ADDRESS = "${value}" as const;`;
@@ -595,8 +611,12 @@ function buildWriteParts(inputs: SynthesisInputs): TemplateParts {
   const frame = buildSharedFrame(inputs);
   const { ctx, chainEmission, argsList } = frame;
 
+  // An action that declares payableValue.fromInput takes msg.value from
+  // that input (the OFT send's nativeFee), so the generated SDK reads it
+  // rather than a separate ethValue the template does not render.
+  const valueSource = ctx.action.payableValue?.fromInput ?? "ethValue";
   const valueLine = ctx.action.payable
-    ? "      value: input.ethValue ? BigInt(input.ethValue) : undefined,"
+    ? `      value: input.${valueSource} ? BigInt(input.${valueSource}) : undefined,`
     : null;
 
   const simulateLines: string[] = [
@@ -661,11 +681,12 @@ function buildSynthesisInputs(
   actionId: string,
   nodeConfig?: Record<string, unknown>
 ): SynthesisInputs | null {
-  const ctx = getProtocolActionContext(actionId);
+  const chainId = nodeConfig?.network as string | undefined;
+  const ctx = getProtocolActionContext(actionId, chainId);
   if (!ctx) {
     return null;
   }
-  const chain = resolveChain(ctx, nodeConfig);
+  const chain = resolveChain(chainId);
   const address = resolveAddress(ctx, chain, nodeConfig);
   const fnVarName = `${camelCaseSlug(ctx.actionSlug)}Step`;
   return { ctx, chain, address, fnVarName };

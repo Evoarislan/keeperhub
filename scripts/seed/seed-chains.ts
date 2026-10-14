@@ -59,7 +59,7 @@ const getChainConfigValue = <T>(
   defaultValue: T
 ): T => getConfigValue(rpcConfig, jsonKey, field, defaultValue);
 
-const DEFAULT_CHAINS: NewChain[] = [
+export const DEFAULT_CHAINS: NewChain[] = [
   {
     chainId: getChainConfigValue("eth-mainnet", "chainId", 1),
     name: "Ethereum Mainnet",
@@ -106,6 +106,29 @@ const DEFAULT_CHAINS: NewChain[] = [
     defaultPrivateRpcUrl: getPrivateRpcUrl({ rpcConfig, jsonKey: "eth-sepolia" }),
   },
   {
+    chainId: getChainConfigValue("eth-hoodi", "chainId", 560_048),
+    name: "Ethereum Hoodi",
+    symbol: getChainConfigValue("eth-hoodi", "symbol", "ETH"),
+    chainType: "evm",
+    defaultPrimaryRpc: getRpcUrlByChainId(560_048, "primary"),
+    defaultFallbackRpc: getRpcUrlByChainId(560_048, "fallback"),
+    defaultPrimaryWss: getWssUrl({
+      rpcConfig,
+      jsonKey: CHAIN_CONFIG[560_048].jsonKey,
+      type: "primary",
+    }),
+    defaultFallbackWss: getWssUrl({
+      rpcConfig,
+      jsonKey: CHAIN_CONFIG[560_048].jsonKey,
+      type: "fallback",
+    }),
+    isTestnet: getChainConfigValue("eth-hoodi", "isTestnet", true),
+    isEnabled: getChainConfigValue("eth-hoodi", "isEnabled", true),
+    usePrivateMempoolRpc: getUsePrivateMempoolRpc({ rpcConfig, jsonKey: "eth-hoodi" }),
+    defaultPrivateRpcUrl: getPrivateRpcUrl({ rpcConfig, jsonKey: "eth-hoodi" }),
+    aliases: ["hoodi", "eth-hoodi"],
+  },
+  {
     chainId: getChainConfigValue("base-mainnet", "chainId", 8453),
     name: "Base",
     symbol: getChainConfigValue("base-mainnet", "symbol", "BASE"),
@@ -150,6 +173,58 @@ const DEFAULT_CHAINS: NewChain[] = [
     isEnabled: getChainConfigValue("base-testnet", "isEnabled", true),
     usePrivateMempoolRpc: getUsePrivateMempoolRpc({ rpcConfig, jsonKey: "base-testnet" }),
     defaultPrivateRpcUrl: getPrivateRpcUrl({ rpcConfig, jsonKey: "base-testnet" }),
+  },
+  // Unichain (Uniswap Labs' OP Stack L2). Native gas is ETH, same as Base
+  // and Optimism -- no USDC-as-gas quirk, no missing WSS. Both networks
+  // verified live: eth_chainId on the official RPC returns 0x82 (130) on
+  // mainnet and 0x515 (1301) on Sepolia testnet, and both public WSS
+  // mirrors complete a real eth_subscribe-capable handshake.
+  {
+    chainId: getChainConfigValue("unichain-mainnet", "chainId", 130),
+    name: "Unichain",
+    symbol: getChainConfigValue("unichain-mainnet", "symbol", "ETH"),
+    chainType: "evm",
+    defaultPrimaryRpc: getRpcUrlByChainId(130, "primary"),
+    defaultFallbackRpc: getRpcUrlByChainId(130, "fallback"),
+    defaultPrimaryWss: getWssUrl({
+      rpcConfig,
+      jsonKey: CHAIN_CONFIG[130].jsonKey,
+      type: "primary",
+    }),
+    defaultFallbackWss: getWssUrl({
+      rpcConfig,
+      jsonKey: CHAIN_CONFIG[130].jsonKey,
+      type: "fallback",
+    }),
+    isTestnet: getChainConfigValue("unichain-mainnet", "isTestnet", false),
+    isEnabled: getChainConfigValue("unichain-mainnet", "isEnabled", true),
+    status: "experimental",
+    usePrivateMempoolRpc: getUsePrivateMempoolRpc({ rpcConfig, jsonKey: "unichain-mainnet" }),
+    defaultPrivateRpcUrl: getPrivateRpcUrl({ rpcConfig, jsonKey: "unichain-mainnet" }),
+    aliases: ["unichain"],
+  },
+  {
+    chainId: getChainConfigValue("unichain-testnet", "chainId", 1301),
+    name: "Unichain Sepolia",
+    symbol: getChainConfigValue("unichain-testnet", "symbol", "ETH"),
+    chainType: "evm",
+    defaultPrimaryRpc: getRpcUrlByChainId(1301, "primary"),
+    defaultFallbackRpc: getRpcUrlByChainId(1301, "fallback"),
+    defaultPrimaryWss: getWssUrl({
+      rpcConfig,
+      jsonKey: CHAIN_CONFIG[1301].jsonKey,
+      type: "primary",
+    }),
+    defaultFallbackWss: getWssUrl({
+      rpcConfig,
+      jsonKey: CHAIN_CONFIG[1301].jsonKey,
+      type: "fallback",
+    }),
+    isTestnet: getChainConfigValue("unichain-testnet", "isTestnet", true),
+    isEnabled: getChainConfigValue("unichain-testnet", "isEnabled", true),
+    status: "experimental",
+    usePrivateMempoolRpc: getUsePrivateMempoolRpc({ rpcConfig, jsonKey: "unichain-testnet" }),
+    defaultPrivateRpcUrl: getPrivateRpcUrl({ rpcConfig, jsonKey: "unichain-testnet" }),
   },
   {
     chainId: getChainConfigValue("tempo-testnet", "chainId", 42_431),
@@ -438,6 +513,55 @@ const DEFAULT_CHAINS: NewChain[] = [
     usePrivateMempoolRpc: getUsePrivateMempoolRpc({ rpcConfig, jsonKey: "avax-fuji" }),
     defaultPrivateRpcUrl: getPrivateRpcUrl({ rpcConfig, jsonKey: "avax-fuji" }),
   },
+  // Somnia chains
+  {
+    chainId: getChainConfigValue("somnia-mainnet", "chainId", 5031),
+    name: "Somnia",
+    symbol: getChainConfigValue("somnia-mainnet", "symbol", "SOMI"),
+    chainType: "evm",
+    defaultPrimaryRpc: getRpcUrlByChainId(5031, "primary"),
+    defaultFallbackRpc: getRpcUrlByChainId(5031, "fallback"),
+    defaultPrimaryWss: getWssUrl({
+      rpcConfig,
+      jsonKey: CHAIN_CONFIG[5031].jsonKey,
+      type: "primary",
+    }),
+    defaultFallbackWss: getWssUrl({
+      rpcConfig,
+      jsonKey: CHAIN_CONFIG[5031].jsonKey,
+      type: "fallback",
+    }),
+    isTestnet: getChainConfigValue("somnia-mainnet", "isTestnet", false),
+    isEnabled: getChainConfigValue("somnia-mainnet", "isEnabled", true),
+    status: "experimental",
+    usePrivateMempoolRpc: getUsePrivateMempoolRpc({ rpcConfig, jsonKey: "somnia-mainnet" }),
+    defaultPrivateRpcUrl: getPrivateRpcUrl({ rpcConfig, jsonKey: "somnia-mainnet" }),
+    aliases: ["somnia"],
+  },
+  {
+    chainId: getChainConfigValue("somnia-shannon", "chainId", 50_312),
+    name: "Somnia Shannon",
+    symbol: getChainConfigValue("somnia-shannon", "symbol", "STT"),
+    chainType: "evm",
+    defaultPrimaryRpc: getRpcUrlByChainId(50_312, "primary"),
+    defaultFallbackRpc: getRpcUrlByChainId(50_312, "fallback"),
+    defaultPrimaryWss: getWssUrl({
+      rpcConfig,
+      jsonKey: CHAIN_CONFIG[50_312].jsonKey,
+      type: "primary",
+    }),
+    defaultFallbackWss: getWssUrl({
+      rpcConfig,
+      jsonKey: CHAIN_CONFIG[50_312].jsonKey,
+      type: "fallback",
+    }),
+    isTestnet: getChainConfigValue("somnia-shannon", "isTestnet", true),
+    isEnabled: getChainConfigValue("somnia-shannon", "isEnabled", true),
+    status: "experimental",
+    usePrivateMempoolRpc: getUsePrivateMempoolRpc({ rpcConfig, jsonKey: "somnia-shannon" }),
+    defaultPrivateRpcUrl: getPrivateRpcUrl({ rpcConfig, jsonKey: "somnia-shannon" }),
+    aliases: [],
+  },
   // Plasma chains
   {
     chainId: getChainConfigValue("plasma-mainnet", "chainId", 9745),
@@ -579,6 +703,32 @@ const DEFAULT_CHAINS: NewChain[] = [
     usePrivateMempoolRpc: getUsePrivateMempoolRpc({ rpcConfig, jsonKey: "robinhood-testnet" }),
     defaultPrivateRpcUrl: getPrivateRpcUrl({ rpcConfig, jsonKey: "robinhood-testnet" }),
   },
+  // HyperEVM (Hyperliquid's EVM). Mainnet only: the testnet (998) has a working
+  // RPC but no explorer API to back ABI auto-fetch and links.
+  {
+    chainId: getChainConfigValue("hyperevm-mainnet", "chainId", 999),
+    name: "HyperEVM",
+    symbol: getChainConfigValue("hyperevm-mainnet", "symbol", "HYPE"),
+    chainType: "evm",
+    defaultPrimaryRpc: getRpcUrlByChainId(999, "primary"),
+    defaultFallbackRpc: getRpcUrlByChainId(999, "fallback"),
+    defaultPrimaryWss: getWssUrl({
+      rpcConfig,
+      jsonKey: CHAIN_CONFIG[999].jsonKey,
+      type: "primary",
+    }),
+    defaultFallbackWss: getWssUrl({
+      rpcConfig,
+      jsonKey: CHAIN_CONFIG[999].jsonKey,
+      type: "fallback",
+    }),
+    isTestnet: getChainConfigValue("hyperevm-mainnet", "isTestnet", false),
+    isEnabled: getChainConfigValue("hyperevm-mainnet", "isEnabled", true),
+    status: "experimental",
+    usePrivateMempoolRpc: getUsePrivateMempoolRpc({ rpcConfig, jsonKey: "hyperevm-mainnet" }),
+    defaultPrivateRpcUrl: getPrivateRpcUrl({ rpcConfig, jsonKey: "hyperevm-mainnet" }),
+    aliases: ["hyperevm"],
+  },
   // Solana chains (non-EVM - uses SolanaProviderManager)
   {
     chainId: getChainConfigValue("solana-mainnet", "chainId", 101),
@@ -624,13 +774,62 @@ const DEFAULT_CHAINS: NewChain[] = [
     usePrivateMempoolRpc: getUsePrivateMempoolRpc({ rpcConfig, jsonKey: "solana-testnet" }),
     defaultPrivateRpcUrl: getPrivateRpcUrl({ rpcConfig, jsonKey: "solana-testnet" }),
   },
+  // Arc Mainnet (Circle) - USDC is the native gas token, not ETH.
+  {
+    chainId: getChainConfigValue("arc-mainnet", "chainId", 5042),
+    name: "Arc",
+    symbol: getChainConfigValue("arc-mainnet", "symbol", "USDC"),
+    chainType: "evm",
+    defaultPrimaryRpc: getRpcUrlByChainId(5042, "primary"),
+    defaultFallbackRpc: getRpcUrlByChainId(5042, "fallback"),
+    defaultPrimaryWss: getWssUrl({
+      rpcConfig,
+      jsonKey: CHAIN_CONFIG[5042].jsonKey,
+      type: "primary",
+    }),
+    defaultFallbackWss: getWssUrl({
+      rpcConfig,
+      jsonKey: CHAIN_CONFIG[5042].jsonKey,
+      type: "fallback",
+    }),
+    isTestnet: getChainConfigValue("arc-mainnet", "isTestnet", false),
+    isEnabled: getChainConfigValue("arc-mainnet", "isEnabled", true),
+    status: "experimental",
+    usePrivateMempoolRpc: getUsePrivateMempoolRpc({ rpcConfig, jsonKey: "arc-mainnet" }),
+    defaultPrivateRpcUrl: getPrivateRpcUrl({ rpcConfig, jsonKey: "arc-mainnet" }),
+    aliases: ["arc"],
+  },
+  // Arc Testnet (Circle) - USDC is the native gas token, not ETH
+  {
+    chainId: getChainConfigValue("arc-testnet", "chainId", 5_042_002),
+    name: "Arc Testnet",
+    symbol: getChainConfigValue("arc-testnet", "symbol", "USDC"),
+    chainType: "evm",
+    defaultPrimaryRpc: getRpcUrlByChainId(5_042_002, "primary"),
+    defaultFallbackRpc: getRpcUrlByChainId(5_042_002, "fallback"),
+    defaultPrimaryWss: getWssUrl({
+      rpcConfig,
+      jsonKey: CHAIN_CONFIG[5_042_002].jsonKey,
+      type: "primary",
+    }),
+    defaultFallbackWss: getWssUrl({
+      rpcConfig,
+      jsonKey: CHAIN_CONFIG[5_042_002].jsonKey,
+      type: "fallback",
+    }),
+    isTestnet: getChainConfigValue("arc-testnet", "isTestnet", true),
+    isEnabled: getChainConfigValue("arc-testnet", "isEnabled", true),
+    status: "experimental",
+    usePrivateMempoolRpc: getUsePrivateMempoolRpc({ rpcConfig, jsonKey: "arc-testnet" }),
+    defaultPrivateRpcUrl: getPrivateRpcUrl({ rpcConfig, jsonKey: "arc-testnet" }),
+  },
 ];
 
 // Explorer configuration template for each chain (KEEP-1154)
 // All Etherscan-family chains use the unified V2 API (api.etherscan.io/v2/api)
 // with chainid param - one API key covers all chains.
 // Note: chainIds are resolved dynamically from DEFAULT_CHAINS to ensure consistency
-const EXPLORER_CONFIG_TEMPLATES: Record<
+export const EXPLORER_CONFIG_TEMPLATES: Record<
   number,
   Omit<NewExplorerConfig, "chainId">
 > = {
@@ -648,6 +847,16 @@ const EXPLORER_CONFIG_TEMPLATES: Record<
   11155111: {
     chainType: "evm",
     explorerUrl: "https://sepolia.etherscan.io",
+    explorerApiType: "etherscan",
+    explorerApiUrl: "https://api.etherscan.io/v2/api",
+    explorerTxPath: "/tx/{hash}",
+    explorerAddressPath: "/address/{address}",
+    explorerContractPath: "/address/{address}#code",
+  },
+  // Ethereum Hoodi - Etherscan V2
+  560048: {
+    chainType: "evm",
+    explorerUrl: "https://hoodi.etherscan.io",
     explorerApiType: "etherscan",
     explorerApiUrl: "https://api.etherscan.io/v2/api",
     explorerTxPath: "/tx/{hash}",
@@ -674,6 +883,31 @@ const EXPLORER_CONFIG_TEMPLATES: Record<
     explorerAddressPath: "/address/{address}",
     explorerContractPath: "/address/{address}#code",
   },
+  // Unichain Mainnet - Etherscan V2 (Uniscan). api.etherscan.io/v2/api
+  // recognizes chainid=130 today (confirmed: a request with a placeholder
+  // key gets "Missing/Invalid API Key", not an unsupported-chain error), so
+  // this reuses the same shared key as every other etherscan-type chain
+  // here rather than needing a separate Uniscan API key.
+  130: {
+    chainType: "evm",
+    explorerUrl: "https://uniscan.xyz",
+    explorerApiType: "etherscan",
+    explorerApiUrl: "https://api.etherscan.io/v2/api",
+    explorerTxPath: "/tx/{hash}",
+    explorerAddressPath: "/address/{address}",
+    explorerContractPath: "/address/{address}#code",
+  },
+  // Unichain Sepolia - Etherscan V2 (Uniscan). Same shared-key path;
+  // chainid=1301 confirmed the same way as mainnet's 130.
+  1301: {
+    chainType: "evm",
+    explorerUrl: "https://sepolia.uniscan.xyz",
+    explorerApiType: "etherscan",
+    explorerApiUrl: "https://api.etherscan.io/v2/api",
+    explorerTxPath: "/tx/{hash}",
+    explorerAddressPath: "/address/{address}",
+    explorerContractPath: "/address/{address}#code",
+  },
   // Tempo Testnet - Blockscout
   42431: {
     chainType: "evm",
@@ -690,6 +924,20 @@ const EXPLORER_CONFIG_TEMPLATES: Record<
     explorerUrl: "https://explore.mainnet.tempo.xyz",
     explorerApiType: "blockscout",
     explorerApiUrl: "https://explore.mainnet.tempo.xyz/api",
+    explorerTxPath: "/tx/{hash}",
+    explorerAddressPath: "/address/{address}",
+    explorerContractPath: "/address/{address}?tab=contract",
+  },
+  // Arc Mainnet - the Blockscout frontend went live 2026-09-16 and its
+  // /api/v2/* is still behind a Cloudflare challenge, so the API half comes
+  // from Etherscan V2, which serves chain 5042 ("Arc Mainnet") on the same
+  // endpoint the other V2-family chains use. Links still open on
+  // explorer.arc.io.
+  5042: {
+    chainType: "evm",
+    explorerUrl: "https://explorer.arc.io",
+    explorerApiType: "etherscan",
+    explorerApiUrl: "https://api.etherscan.io/v2/api",
     explorerTxPath: "/tx/{hash}",
     explorerAddressPath: "/address/{address}",
     explorerContractPath: "/address/{address}?tab=contract",
@@ -794,6 +1042,27 @@ const EXPLORER_CONFIG_TEMPLATES: Record<
     explorerAddressPath: "/address/{address}",
     explorerContractPath: "/address/{address}#code",
   },
+  // Somnia Mainnet - Blockscout. The trailing slash matters: bare /api
+  // answers with a 301 to http://.
+  5031: {
+    chainType: "evm",
+    explorerUrl: "https://explorer.somnia.network",
+    explorerApiType: "blockscout",
+    explorerApiUrl: "https://explorer.somnia.network/api/",
+    explorerTxPath: "/tx/{hash}",
+    explorerAddressPath: "/address/{address}",
+    explorerContractPath: "/address/{address}?tab=contract",
+  },
+  // Somnia Shannon Testnet - Blockscout
+  50312: {
+    chainType: "evm",
+    explorerUrl: "https://shannon-explorer.somnia.network",
+    explorerApiType: "blockscout",
+    explorerApiUrl: "https://shannon-explorer.somnia.network/api",
+    explorerTxPath: "/tx/{hash}",
+    explorerAddressPath: "/address/{address}",
+    explorerContractPath: "/address/{address}?tab=contract",
+  },
   // Plasma Mainnet - Etherscan V2 (Plasmascan)
   9745: {
     chainType: "evm",
@@ -854,6 +1123,17 @@ const EXPLORER_CONFIG_TEMPLATES: Record<
     explorerAddressPath: "/address/{address}",
     explorerContractPath: "/address/{address}?tab=contract",
   },
+  // HyperEVM Mainnet - Etherscan V2 (HyperEVMScan). Listed in Etherscan's V2
+  // chainlist as chainid 999, status 1, on 2026-09-15.
+  999: {
+    chainType: "evm",
+    explorerUrl: "https://hyperevmscan.io",
+    explorerApiType: "etherscan",
+    explorerApiUrl: "https://api.etherscan.io/v2/api",
+    explorerTxPath: "/tx/{hash}",
+    explorerAddressPath: "/address/{address}",
+    explorerContractPath: "/address/{address}#code",
+  },
   // Solana Mainnet - Solscan
   101: {
     chainType: "solana",
@@ -874,9 +1154,100 @@ const EXPLORER_CONFIG_TEMPLATES: Record<
     explorerAddressPath: "/account/{address}",
     explorerContractPath: "/account/{address}#anchorProgramIDL",
   },
+  // Arc Testnet - Blockscout. Circle's own host rather than
+  // testnet.arcscan.app, which now answers 301 and redirects here: the API
+  // client posts to explorerApiUrl, and a redirect on that hop is a failure
+  // for any caller that does not follow one.
+  5042002: {
+    chainType: "evm",
+    explorerUrl: "https://explorer.testnet.arc.io",
+    explorerApiType: "blockscout",
+    explorerApiUrl: "https://explorer.testnet.arc.io/api",
+    explorerTxPath: "/tx/{hash}",
+    explorerAddressPath: "/address/{address}",
+    explorerContractPath: "/address/{address}?tab=contract",
+  },
 };
 
+// Joins a seeded chain to its explorer template by display name. The chain's
+// own chainId can be overridden per environment through CHAIN_RPC_CONFIG, so
+// the name is the stable key and this map turns it back into the default id
+// the templates are keyed by. Every DEFAULT_CHAINS entry needs a row here;
+// tests/unit/seed-chains-explorer-coverage.test.ts fails when one is missing.
+export const CHAIN_TO_DEFAULT_ID: Record<string, number> = {
+  "Ethereum Mainnet": 1,
+  "Ethereum Sepolia": 11_155_111,
+  "Ethereum Hoodi": 560_048,
+  Base: 8453,
+  "Base Sepolia": 84_532,
+  Unichain: 130,
+  "Unichain Sepolia": 1301,
+  "Tempo Testnet": 42_431,
+  Tempo: 4217,
+  "BNB Chain": 56,
+  "BNB Chain Testnet": 97,
+  Polygon: 137,
+  "Arbitrum One": 42_161,
+  "Polygon Amoy": 80_002,
+  "Arbitrum Sepolia": 421_614,
+  Optimism: 10,
+  "Optimism Sepolia": 11_155_420,
+  Avalanche: 43_114,
+  "Avalanche Fuji": 43_113,
+  Somnia: 5031,
+  "Somnia Shannon": 50_312,
+  Plasma: 9745,
+  "Plasma Testnet": 9746,
+  "0G": 16_661,
+  "0G Galileo": 16_602,
+  "Robinhood Chain": 4663,
+  "Robinhood Chain Testnet": 46_630,
+  HyperEVM: 999,
+  Solana: 101,
+  "Solana Devnet": 103,
+  "Arc Testnet": 5_042_002,
+  Arc: 5042,
+};
+
+// The explorer_configs rows the seed writes: one per chain, keyed by the
+// chain's resolved chainId, with the template looked up through the name map.
+//
+// A chain with no map entry or no template throws. This used to be a
+// console.warn followed by a zero exit, which is how a chain shipped without
+// an explorer: the seed said so once, in a deploy log nobody was reading.
+export function buildExplorerConfigs(
+  seededChains: readonly NewChain[],
+  nameToDefaultId: Record<string, number>,
+  templates: Record<number, Omit<NewExplorerConfig, "chainId">>
+): NewExplorerConfig[] {
+  return seededChains.map((chain) => {
+    const defaultChainId = nameToDefaultId[chain.name];
+    if (defaultChainId === undefined) {
+      throw new Error(
+        `No CHAIN_TO_DEFAULT_ID entry for chain "${chain.name}" (${chain.chainId}); add one so the chain gets an explorer config`
+      );
+    }
+    const template = templates[defaultChainId];
+    if (template === undefined) {
+      throw new Error(
+        `No EXPLORER_CONFIG_TEMPLATES entry for chain "${chain.name}" (default id ${defaultChainId})`
+      );
+    }
+    return { chainId: chain.chainId, ...template };
+  });
+}
+
+
 async function seedChains() {
+  // Resolved before anything is written: a chain with no explorer mapping
+  // fails the run here, with the database untouched, rather than after every
+  // chain row has been upserted and stale ones disabled.
+  const EXPLORER_CONFIGS = buildExplorerConfigs(
+    DEFAULT_CHAINS,
+    CHAIN_TO_DEFAULT_ID,
+    EXPLORER_CONFIG_TEMPLATES
+  );
+
   const connectionString = getDatabaseUrl();
 
   console.log("Connecting to database...");
@@ -965,54 +1336,6 @@ async function seedChains() {
     }
   }
 
-  // Build EXPLORER_CONFIGS dynamically using resolved chainIds from DEFAULT_CHAINS
-  // This ensures chainId consistency between chains and explorer configs
-  // We map each chain to its explorer config using the CHAIN_CONFIG to find the default chainId
-  const chainToDefaultIdMap: Record<string, number> = {
-    "Ethereum Mainnet": 1,
-    "Ethereum Sepolia": 11_155_111,
-    Base: 8453,
-    "Base Sepolia": 84_532,
-    "Tempo Testnet": 42_431,
-    Tempo: 4217,
-    "BNB Chain": 56,
-    "BNB Chain Testnet": 97,
-    Polygon: 137,
-    "Arbitrum One": 42_161,
-    "Polygon Amoy": 80_002,
-    "Arbitrum Sepolia": 421_614,
-    Optimism: 10,
-    "Optimism Sepolia": 11_155_420,
-    Avalanche: 43_114,
-    "Avalanche Fuji": 43_113,
-    Plasma: 9745,
-    "Plasma Testnet": 9746,
-    "0G": 16_661,
-    "0G Galileo": 16_602,
-    "Robinhood Chain": 4663,
-    "Robinhood Chain Testnet": 46_630,
-    Solana: 101,
-    "Solana Devnet": 103,
-  };
-
-  const EXPLORER_CONFIGS: NewExplorerConfig[] = DEFAULT_CHAINS.map((chain) => {
-    // Look up the default chainId using the chain name
-    const defaultChainId = chainToDefaultIdMap[chain.name];
-
-    if (!(defaultChainId && EXPLORER_CONFIG_TEMPLATES[defaultChainId])) {
-      console.warn(
-        `  ! No explorer config template for chain ${chain.name} (${chain.chainId}), skipping`
-      );
-      return null;
-    }
-
-    const template = EXPLORER_CONFIG_TEMPLATES[defaultChainId];
-    return {
-      chainId: chain.chainId, // Use the resolved chainId from the chain
-      ...template,
-    };
-  }).filter((config): config is NewExplorerConfig => config !== null);
-
   console.log(`\nSeeding ${EXPLORER_CONFIGS.length} explorer configs...`);
 
   for (const config of EXPLORER_CONFIGS) {
@@ -1055,7 +1378,13 @@ async function seedChains() {
   process.exit(0);
 }
 
-seedChains().catch((err) => {
-  console.error("Error seeding chains:", err);
-  process.exit(1);
-});
+// Only when run directly, so a test can import DEFAULT_CHAINS and the
+// explorer join without connecting to a database. `require.main === module`
+// rather than a process.argv[1] comparison; scripts/check-api-docs-routes.ts
+// records why.
+if (require.main === module) {
+  seedChains().catch((err) => {
+    console.error("Error seeding chains:", err);
+    process.exit(1);
+  });
+}

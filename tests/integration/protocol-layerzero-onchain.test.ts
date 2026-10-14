@@ -3,16 +3,21 @@
  *
  * Proves that the ABI-driven LayerZero protocol definition produces
  * calldata the deployed contracts accept on Ethereum mainnet, and - for
- * the eleven reads - that what comes back decodes into the shapes the
- * runtime expects. The twelfth action is a write and is simulated only:
- * USDT's approve returns no data, so there is nothing to decode and that
- * test asserts acceptance rather than a return value. Three
- * deployments answer: the USDT0 OFT Adapter, the USDT token it locks,
- * and the LayerZero EndpointV2. Every action goes through the shared
- * calldata builder, so the test exercises the definition itself - its
- * flattened SendParam tuple, the padAddressToBytes transform on the
- * recipient, and the ABIs - rather than a hand-written ABI that could
- * drift from it.
+ * eleven of the twelve reads - that what comes back decodes into the shapes
+ * the runtime expects. The twelfth read, Endpoint Message Executable, has
+ * its own suite at the end of this file, run against every chain in its
+ * view map. The two writes are simulated only. USDT's approve returns no
+ * data, so there is nothing to decode and that test asserts acceptance
+ * rather than a return value. The OFT send is simulated with the sender's
+ * balances written in as eth_call state overrides, and asserts the
+ * receipts it returns plus the two revert selectors the fee rule produces.
+ * In the mainnet suite three deployments answer: the USDT0 OFT Adapter, the
+ * USDT token it locks, and the LayerZero EndpointV2. Every action goes
+ * through the shared calldata builder, so the test exercises the definition
+ * itself - its flattened SendParam and MessagingFee tuples, the
+ * padAddressToBytes transform on the recipient, the weiToEther transform on
+ * the payable value, and the ABIs - rather than a hand-written ABI that
+ * could drift from it.
  *
  * The asserted values are long-lived invariants of that deployment
  * (approval model, shared decimals, underlying token, wired peer, send
@@ -43,6 +48,10 @@ import { beforeAll, describe, expect, it, vi } from "vitest";
 // otherwise throw under vitest's Node runtime.
 vi.mock("server-only", () => ({}));
 
+import {
+  applyEthValueTransform,
+  readPayableValue,
+} from "@/lib/execute/protocol-eth-value";
 import { getRpcProviderFromUrls } from "@/lib/rpc/provider-factory";
 import type { RpcProviderManager } from "@/lib/rpc/providers";
 import {
@@ -51,7 +60,10 @@ import {
   PUBLIC_RPCS,
   parseRpcConfig,
 } from "@/lib/rpc/rpc-config";
-import layerzeroDef, { LAYERZERO_EIDS } from "@/protocols/layerzero";
+import layerzeroDef, {
+  LAYERZERO_EIDS,
+  OFT_SEND_FIXTURE_FEE_WEI,
+} from "@/protocols/layerzero";
 import { buildCalldata } from "./_shared/build-calldata";
 import { itOnchain } from "./_shared/onchain-rpc";
 
@@ -93,6 +105,79 @@ const ARBITRUM_OFT_PEER = ethers.zeroPadValue(
   layerzeroDef.contracts.oft.addresses["42161"],
   32
 );
+
+// USDT storage layout for the send simulation below: `balances` is mapping
+// slot 2 and `allowed` is nested-mapping slot 5 (TetherToken.sol). Both
+// verified against balanceOf/allowance on mainnet through eth_call state
+// overrides on 2026-09-15, the same mechanism the test uses.
+const USDT_BALANCES_SLOT = 2;
+const USDT_ALLOWED_SLOT = 5;
+// Custom error selectors the send reverts with. NotEnoughNative(uint256) is
+// OAppSender's equality check on msg.value; LZ_InsufficientFee(...) is the
+// endpoint's check that the fee covers the live quote.
+const NOT_ENOUGH_NATIVE_SELECTOR = ethers
+  .id("NotEnoughNative(uint256)")
+  .slice(0, 10);
+const LZ_INSUFFICIENT_FEE_SELECTOR = ethers
+  .id("LZ_InsufficientFee(uint256,uint256,uint256,uint256)")
+  .slice(0, 10);
+
+type StateOverride = Record<
+  string,
+  { balance?: string; stateDiff?: Record<string, string> }
+>;
+
+/** Solidity mapping slot for `mapping(address => T)` at root `slot`. */
+function mappingSlot(key: string, slot: number | bigint): string {
+  return ethers.keccak256(
+    ethers.AbiCoder.defaultAbiCoder().encode(
+      ["address", "uint256"],
+      [key, slot]
+    )
+  );
+}
+
+/**
+ * State the send needs and nothing else: the sender holds native for the
+ * fee, holds USDT to lock, and has approved the adapter for exactly the
+ * send amount. Written as an eth_call state override rather than through
+ * anvil, so this runs against a plain mainnet endpoint on every PR (the
+ * fork tier covers the real transaction).
+ */
+function fundedSenderOverride(
+  sender: string,
+  nativeWei: bigint,
+  usdtUnits: bigint
+): StateOverride {
+  return {
+    // A QUANTITY: JSON-RPC forbids leading zeros, and geth-based endpoints
+    // reject toBeHex's even-length padding ("0x0de0...") as an override.
+    [sender]: { balance: ethers.toQuantity(nativeWei) },
+    [USDT]: {
+      stateDiff: {
+        [mappingSlot(sender, USDT_BALANCES_SLOT)]: ethers.toBeHex(
+          usdtUnits,
+          32
+        ),
+        [mappingSlot(
+          USDT0_OFT_ADAPTER,
+          BigInt(mappingSlot(sender, USDT_ALLOWED_SLOT))
+        )]: ethers.toBeHex(usdtUnits, 32),
+      },
+    },
+  };
+}
+
+/** The 4-byte selector of a custom-error revert, or the raw message. */
+function revertSelector(err: unknown): string {
+  const e = err as {
+    data?: unknown;
+    error?: { data?: unknown };
+    message?: string;
+  };
+  const data = typeof e.data === "string" ? e.data : e.error?.data;
+  return typeof data === "string" ? data.slice(0, 10) : String(e.message);
+}
 
 // Resolve Ethereum mainnet RPC URLs via the shared config pipeline:
 // CHAIN_RPC_CONFIG first, individual env vars second, public default last.
@@ -397,6 +482,156 @@ describe("LayerZero OFT and EndpointV2 on-chain integration", () => {
     30_000
   );
 
+  // The send is simulated with the sender's balances and allowance written
+  // in as eth_call state overrides, because an unfunded call reverts with
+  // no data (USDT's transferFrom fails on a bare require) and an empty
+  // revert cannot be told apart from a selector the proxy does not
+  // implement. With the state in place the call returns the two receipts,
+  // which is the proof that the flattened SendParam, the flattened
+  // MessagingFee, the padded recipient and the payable value all reached
+  // the deployed adapter in the shape it expects.
+  //
+  // `value` goes through the same weiToEther transform the write step and
+  // the calldata harness apply, then parseEther, so a regression in either
+  // (or the registration going missing) shows up here as msg.value that
+  // does not match fee.nativeFee, and the adapter says so.
+  describe("oft-send against the deployed adapter", () => {
+    const SENDER = "0x1111111111111111111111111111111111111111";
+    const override = fundedSenderOverride(
+      SENDER,
+      ethers.parseEther("1"),
+      AMOUNT_LD_EXPECTED
+    );
+
+    function sendCalldata(nativeFeeWei: string): { to: string; data: string } {
+      const { to, data } = buildCalldata({
+        protocol: layerzeroDef,
+        actionSlug: "oft-send",
+        sampleInputs: {
+          ...SEND_PARAM_SAMPLE,
+          to: SENDER,
+          nativeFee: nativeFeeWei,
+          lzTokenFee: "0",
+          refundAddress: SENDER,
+        },
+        chainId: CHAIN_ID,
+      });
+      return { to, data };
+    }
+
+    // What the write step attaches for a send whose fee input holds `wei`:
+    // readPayableValue takes the value from nativeFee (payableValue.fromInput),
+    // then the action's registered transform converts it to ether.
+    function msgValueFor(wei: string): bigint {
+      const meta = {
+        protocolSlug: "layerzero",
+        contractKey: "oft",
+        functionName: "send",
+      };
+      const source = readPayableValue({ nativeFee: wei }, meta);
+      if (!source.ok) {
+        throw new Error(source.error);
+      }
+      const transformed = applyEthValueTransform(source.value, meta);
+      if (!transformed.ok || typeof transformed.value !== "string") {
+        throw new Error(
+          "layerzero/oft-send value selection or transform failed"
+        );
+      }
+      return ethers.parseEther(transformed.value);
+    }
+
+    async function simulateSend(
+      tx: { to: string; data: string },
+      value: bigint
+    ): Promise<string> {
+      return await manager.executeWithFailover((p) =>
+        p.send("eth_call", [
+          {
+            from: SENDER,
+            to: tx.to,
+            data: tx.data,
+            value: ethers.toQuantity(value),
+          },
+          "latest",
+          override,
+        ])
+      );
+    }
+
+    itOnchain(
+      "returns both receipts when msg.value equals fee.nativeFee at the fixture fee",
+      async () => {
+        const tx = sendCalldata(OFT_SEND_FIXTURE_FEE_WEI);
+        const value = msgValueFor(OFT_SEND_FIXTURE_FEE_WEI);
+        expect(value).toBe(BigInt(OFT_SEND_FIXTURE_FEE_WEI));
+
+        const ret = await simulateSend(tx, value);
+
+        const iface = new ethers.Interface(
+          JSON.parse(layerzeroDef.contracts.oft.abi as string)
+        );
+        const [msgReceipt, oftReceipt] = iface.decodeFunctionResult(
+          "send",
+          ret
+        );
+        // The adapter charges the live quote and refunds the rest, so the
+        // fee it reports is below the fixture's deliberately generous
+        // figure; asserting the receipt's fee is the live quote is what
+        // shows the fixture still clears it.
+        expect(msgReceipt.fee.nativeFee).toBeGreaterThan(ZERO);
+        expect(msgReceipt.fee.nativeFee).toBeLessThanOrEqual(value);
+        expect(msgReceipt.fee.lzTokenFee).toBe(ZERO);
+        expect(msgReceipt.guid).toMatch(/^0x[0-9a-f]{64}$/);
+        // One USDT at six shared decimals: no dust, no adapter fee.
+        expect(oftReceipt.amountSentLD).toBe(AMOUNT_LD_EXPECTED);
+        expect(oftReceipt.amountReceivedLD).toBe(AMOUNT_LD_EXPECTED);
+      },
+      30_000
+    );
+
+    itOnchain(
+      "reverts with NotEnoughNative when msg.value is one wei off fee.nativeFee, either way",
+      async () => {
+        // The rule the help text states: the two fee fields must be equal.
+        // Checked in both directions so a future "overpaying is fine"
+        // assumption cannot creep in - the endpoint does refund excess,
+        // but only excess over the live quote, and only when msg.value
+        // already equals what the caller declared in fee.nativeFee.
+        const tx = sendCalldata(OFT_SEND_FIXTURE_FEE_WEI);
+        const value = msgValueFor(OFT_SEND_FIXTURE_FEE_WEI);
+        for (const off of [value - BigInt(1), value + BigInt(1)]) {
+          let selector = "";
+          try {
+            await simulateSend(tx, off);
+          } catch (err) {
+            selector = revertSelector(err);
+          }
+          expect(selector, `msg.value ${off}`).toBe(NOT_ENOUGH_NATIVE_SELECTOR);
+        }
+      },
+      30_000
+    );
+
+    itOnchain(
+      "reverts with LZ_InsufficientFee when both fee fields agree but sit below the quote",
+      async () => {
+        // A stale or hand-typed fee that the two fields agree on still
+        // fails, at the endpoint rather than the OFT. One wei is the
+        // smallest such fee; the live quote is never that low.
+        const tx = sendCalldata("1");
+        let selector = "";
+        try {
+          await simulateSend(tx, msgValueFor("1"));
+        } catch (err) {
+          selector = revertSelector(err);
+        }
+        expect(selector).toBe(LZ_INSUFFICIENT_FEE_SELECTOR);
+      },
+      30_000
+    );
+  });
+
   itOnchain(
     "oft-approve: deployed USDT accepts the calldata",
     async () => {
@@ -578,28 +813,46 @@ describe("LayerZero reference map completeness", () => {
 // fourth endpoint action in front of users to serve a test, so the address
 // map - which is the thing under test here - is checked directly instead.
 // Values read over eth_call on 2026-09-09; all seven match LAYERZERO_EIDS.
+//
+// The loop follows the endpoint address map rather than LAYERZERO_EIDS,
+// which now publishes an endpoint ID for a wider set of chains so the
+// view read below can reach them. Only chains with an endpoint address have
+// something to call here.
 const EID_ABI = ["function eid() view returns (uint32)"];
 
+/** Failover-aware manager for a chain in one of the LayerZero address maps. */
+async function managerForChain(
+  chainId: string,
+  label: string
+): Promise<RpcProviderManager> {
+  const cfg = getChainConfig(Number(chainId));
+  if (!cfg) {
+    throw new Error(
+      `chain ${chainId} is in a LayerZero address map but not in CHAIN_CONFIG, so no RPC can be resolved for it`
+    );
+  }
+  return await getRpcProviderFromUrls(
+    resolveRpcUrl(cfg.jsonKey, cfg.envKey, cfg.publicDefault, "primary"),
+    resolveRpcUrl(
+      cfg.jsonKey,
+      cfg.fallbackEnvKey,
+      cfg.publicFallback ?? cfg.publicDefault,
+      "fallback"
+    ),
+    Number(chainId),
+    label
+  );
+}
+
 describe("LayerZero EndpointV2 deployments identify their own chain", () => {
-  for (const chainId of Object.keys(LAYERZERO_EIDS)) {
+  for (const chainId of Object.keys(
+    layerzeroDef.contracts.endpointV2.addresses
+  )) {
     itOnchain(
       `chain ${chainId} endpoint reports EID ${LAYERZERO_EIDS[chainId]}`,
       async () => {
-        const cfg = getChainConfig(Number(chainId));
-        if (!cfg) {
-          throw new Error(
-            `chain ${chainId} is in LAYERZERO_EIDS but not in CHAIN_CONFIG, so no RPC can be resolved for it`
-          );
-        }
-        const manager = await getRpcProviderFromUrls(
-          resolveRpcUrl(cfg.jsonKey, cfg.envKey, cfg.publicDefault, "primary"),
-          resolveRpcUrl(
-            cfg.jsonKey,
-            cfg.fallbackEnvKey,
-            cfg.publicFallback ?? cfg.publicDefault,
-            "fallback"
-          ),
-          Number(chainId),
+        const manager = await managerForChain(
+          chainId,
           `layerzero-endpoint-eid-${chainId}`
         );
         const iface = new ethers.Interface(EID_ABI);
@@ -609,6 +862,141 @@ describe("LayerZero EndpointV2 deployments identify their own chain", () => {
         );
         const [eid] = iface.decodeFunctionResult("eid", result);
         expect(Number(eid)).toBe(LAYERZERO_EIDS[chainId]);
+      },
+      30_000
+    );
+  }
+});
+
+// The docs tell a reader that identifiers naming no path return 0 forever.
+// That holds at every nonce but 0: executable() answers 3 when the stored
+// payload hash is empty AND the nonce is at or below the path's lazy inbound
+// nonce, and on a path with no history both are zero. A user who types 0, or
+// whose upstream template resolves to one, would otherwise be told a message
+// that was never sent has been delivered. Pinned on Ethereum because the
+// claim is about the contract's logic, not about one chain.
+describe("executable() on a path with no history", () => {
+  const DEAD = "0x000000000000000000000000000000000000dEaD";
+
+  async function stateAtNonce(nonce: number): Promise<number> {
+    const result = await manager.executeWithFailover((p) =>
+      p.call({
+        to: layerzeroDef.contracts.endpointV2View.addresses["1"],
+        data: SHIPPED_VIEW_ABI.encodeFunctionData("executable", [
+          { ...UNUSED_ORIGIN, nonce },
+          DEAD,
+        ]),
+      })
+    );
+    const [state] = SHIPPED_VIEW_ABI.decodeFunctionResult("executable", result);
+    return Number(state);
+  }
+
+  let manager: RpcProviderManager;
+
+  beforeAll(async () => {
+    manager = await managerForChain("1", "layerzero-unsent-nonce");
+  });
+
+  itOnchain(
+    "reports 0 for a nonce a real message would carry",
+    async () => {
+      expect(await stateAtNonce(1)).toBe(0);
+      expect(await stateAtNonce(5)).toBe(0);
+    },
+    30_000
+  );
+
+  itOnchain(
+    "reports 3 for nonce 0, which the docs call out",
+    async () => {
+      expect(await stateAtNonce(0)).toBe(3);
+    },
+    30_000
+  );
+});
+
+// The view map is the one thing standing between a user and a wrong answer
+// on the executable read: the action calls whatever address is listed for
+// the destination chain, and a wrong address either reverts or, worse,
+// answers from some unrelated contract. Every entry is exercised here.
+//
+// executable() on a nonce that was never sent returns NotExecutable (0)
+// rather than reverting, so the assertion is that the call decodes to a
+// value in range. It is encoded and decoded through the ABI the definition
+// ships, so a drift in that file fails here rather than only in a golden
+// generated from it.
+const SHIPPED_VIEW_ABI = new ethers.Interface(
+  JSON.parse(layerzeroDef.contracts.endpointV2View.abi as string)
+);
+// endpoint() is not an action, so it is not in the shipped ABI.
+const VIEW_ENDPOINT_ABI = ["function endpoint() view returns (address)"];
+const UNUSED_ORIGIN = {
+  srcEid: 30_101,
+  sender: ethers.zeroPadValue("0x000000000000000000000000000000000000dEaD", 32),
+  nonce: 1,
+};
+
+describe("LayerZero EndpointV2View deployments answer executable()", () => {
+  for (const chainId of Object.keys(
+    layerzeroDef.contracts.endpointV2View.addresses
+  )) {
+    itOnchain(
+      `chain ${chainId} view returns an execution state`,
+      async () => {
+        const manager = await managerForChain(
+          chainId,
+          `layerzero-endpoint-view-${chainId}`
+        );
+        const iface = SHIPPED_VIEW_ABI;
+        const view = layerzeroDef.contracts.endpointV2View.addresses[chainId];
+        const result = await manager.executeWithFailover((p) =>
+          p.call({
+            to: view,
+            data: iface.encodeFunctionData("executable", [
+              UNUSED_ORIGIN,
+              "0x000000000000000000000000000000000000dEaD",
+            ]),
+          })
+        );
+        const [state] = iface.decodeFunctionResult("executable", result);
+        expect(Number(state)).toBeGreaterThanOrEqual(0);
+        expect(Number(state)).toBeLessThanOrEqual(3);
+
+        // `0 <= state <= 3` alone is satisfied by any contract whose
+        // fallback returns 32 zero bytes. The code size rules out an empty
+        // account or a contract of another shape, but not another view
+        // behind the same proxy, so it is a shape check only.
+        const code = await manager.executeWithFailover((p) => p.getCode(view));
+        expect(code, `code on ${chainId}`).not.toBe("0x");
+
+        // The identity check: ask the view which endpoint it serves, then
+        // ask that endpoint which chain it is on. A transcription error onto
+        // another chain's view fails here, and it is also what pins the 15
+        // endpoint IDs that no other on-chain assertion reaches -- the unit
+        // tests can only compare the constant against itself.
+        const endpointIface = new ethers.Interface(VIEW_ENDPOINT_ABI);
+        const endpointResult = await manager.executeWithFailover((p) =>
+          p.call({
+            to: view,
+            data: endpointIface.encodeFunctionData("endpoint"),
+          })
+        );
+        const [endpointAddress] = endpointIface.decodeFunctionResult(
+          "endpoint",
+          endpointResult
+        );
+        const eidIface = new ethers.Interface(EID_ABI);
+        const eidResult = await manager.executeWithFailover((p) =>
+          p.call({
+            to: endpointAddress as string,
+            data: eidIface.encodeFunctionData("eid"),
+          })
+        );
+        const [eid] = eidIface.decodeFunctionResult("eid", eidResult);
+        expect(Number(eid), `eid reported on chain ${chainId}`).toBe(
+          LAYERZERO_EIDS[chainId]
+        );
       },
       30_000
     );

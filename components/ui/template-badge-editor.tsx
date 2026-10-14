@@ -7,6 +7,7 @@ import { doesNodeExist, getDisplayTextForTemplate } from "@/lib/workflow/editor/
 import { cn } from "@/lib/utils";
 import { nodesAtom, selectedNodeAtom } from "@/lib/workflow/store";
 import {
+  AUTOCOMPLETE_MENU_HEIGHT,
   TemplateAutocomplete,
   type TemplateAutocompleteCloseReason,
 } from "./template-autocomplete";
@@ -78,6 +79,11 @@ export type TemplateBadgeEditorMultilineOptions = {
   rows: number;
   /** When set, limits visible height to this many rows and makes content scrollable */
   maxRows?: number;
+  /**
+   * Fills the parent's height and scrolls past it, ignoring rows and maxRows.
+   * The parent has to have a definite height.
+   */
+  fill?: boolean;
 };
 
 export type TemplateBadgeEditorProps = {
@@ -95,6 +101,17 @@ export type TemplateBadgeEditorProps = {
    */
   multiline?: TemplateBadgeEditorMultilineOptions;
 };
+
+// The caret's on-screen box, or null when there is no usable caret or the
+// browser reports an empty box for it (a collapsed range at a line start).
+function caretRect(): DOMRect | null {
+  const selection = window.getSelection();
+  if (!hasUsableSelection(selection)) {
+    return null;
+  }
+  const rect = selection.getRangeAt(0).getBoundingClientRect();
+  return rect.width === 0 && rect.height === 0 ? null : rect;
+}
 
 // Helper to find all template pattern ranges in text
 function findTemplateRanges(text: string): Array<{ start: number; end: number }> {
@@ -185,19 +202,43 @@ export function TemplateBadgeEditor({
     toStringValue(value)
   );
   const shouldUpdateDisplay = useRef(true);
+  // Read from the blur timeout, which would otherwise close over the value and
+  // the internal text as they stood when focus left, 200 ms earlier.
+  const latestValueRef = useRef(value);
+  latestValueRef.current = value;
+  const internalValueRef = useRef(internalValue);
+  internalValueRef.current = internalValue;
   const [selectedNodeId] = useAtom(selectedNodeAtom);
   const [nodes] = useAtom(nodesAtom);
 
   // Autocomplete state
   const [showAutocomplete, setShowAutocomplete] = useState(false);
   const [autocompletePosition, setAutocompletePosition] = useState({ top: 0, left: 0 });
+  const [autocompletePlacement, setAutocompletePlacement] = useState<"below" | "above">("below");
   const [atSignPosition, setAtSignPosition] = useState<number | null>(null);
   const pendingCursorPosition = useRef<number | null>(null);
 
   const openAutocompleteAtAt = (atPosition: number): void => {
     setAtSignPosition(atPosition);
-    if (contentRef.current) {
+    // A field filling a dialog is as tall as the dialog, so its bottom edge
+    // can be a screen away from the "@" just typed: open at the caret, below
+    // it when the menu fits there, otherwise on whichever side has more room.
+    // Above, the menu is anchored by its bottom edge so it meets the line
+    // however short its list is, rather than letting the menu's viewport
+    // clamp pull it up over the line being typed.
+    const caret = multiline?.fill ? caretRect() : null;
+    if (caret) {
+      const roomBelow = window.innerHeight - caret.bottom - 4;
+      const roomAbove = caret.top - 4;
+      const below = roomBelow >= AUTOCOMPLETE_MENU_HEIGHT || roomBelow >= roomAbove;
+      setAutocompletePlacement(below ? "below" : "above");
+      setAutocompletePosition({
+        top: below ? caret.bottom + 4 : caret.top - 4,
+        left: caret.left,
+      });
+    } else if (contentRef.current) {
       const editorRect = contentRef.current.getBoundingClientRect();
+      setAutocompletePlacement("below");
       setAutocompletePosition({
         top: editorRect.bottom + window.scrollY + 4,
         left: editorRect.left + window.scrollX,
@@ -689,6 +730,18 @@ export function TemplateBadgeEditor({
     setTimeout(() => {
       const active = document.activeElement;
       if (active === contentRef.current) {
+        // Focus is back on the editor, so isFocused never goes false - and the
+        // effect that takes an outside value is gated on it, with no remaining
+        // dep that can change. Reconcile here instead. Anything that writes to
+        // the field while it is blurred lands in this window: the Beautify
+        // action does, and the caret restore below hands focus straight back
+        // inside it. Without this the field keeps showing the old text and the
+        // next keystroke serialises that stale DOM over the new value.
+        const pending = toStringValue(latestValueRef.current);
+        if (pending !== internalValueRef.current) {
+          setInternalValue(pending);
+          shouldUpdateDisplay.current = true;
+        }
         return;
       }
       // Focus moved into the autocomplete (search input or option button).
@@ -865,7 +918,9 @@ export function TemplateBadgeEditor({
   // Calculate min height based on rows; max height when maxRows is set
   // (truncates display, scrollable). Single-line editors get no inline style.
   let style: CSSProperties | undefined;
-  if (multiline) {
+  if (multiline?.fill) {
+    style = { height: "100%", overflowY: "auto" };
+  } else if (multiline) {
     style = { minHeight: `${multiline.rows * 1.5}rem` };
     if (multiline.maxRows !== undefined) {
       style.maxHeight = `${multiline.maxRows * 1.5}rem`;
@@ -888,7 +943,12 @@ export function TemplateBadgeEditor({
         <div
           className={
             multiline
-              ? "min-w-0 flex-1 whitespace-pre-wrap break-words outline-none"
+              ? cn(
+                  "min-w-0 flex-1 whitespace-pre-wrap break-words outline-none",
+                  // Filling a dialog, the whole box takes a click, not only
+                  // the lines of text at its top.
+                  multiline.fill && "self-stretch"
+                )
               : "min-w-0 flex-1 overflow-hidden whitespace-nowrap outline-none"
           }
           contentEditable={!disabled}
@@ -927,6 +987,7 @@ export function TemplateBadgeEditor({
         isOpen={showAutocomplete}
         onClose={closeAutocomplete}
         onSelect={handleAutocompleteSelect}
+        placement={autocompletePlacement}
         position={autocompletePosition}
       />
     </>

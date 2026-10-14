@@ -23,6 +23,7 @@ import {
   isNearHeadBatch,
   MAX_BATCH_RETRIES,
   queryBatchWithRetry,
+  queryLogsWithRetry,
   TIP_SAFETY_MARGIN_BLOCKS,
 } from "@/plugins/web3/steps/query-events-core";
 
@@ -185,6 +186,105 @@ describe("queryBatchWithRetry", () => {
       100,
       "latest"
     );
+  });
+
+  it("passes a compiled topic filter straight through instead of the ABI event filter", async () => {
+    const topics = ["0xtopic0", "0xsender"];
+    mockQueryFilter.mockResolvedValue([{ blockNumber: 50 }]);
+    const executeWithFailover = vi.fn((operation) => operation(fakeProvider()));
+
+    const promise = queryBatchWithRetry(
+      mockRpc(executeWithFailover),
+      "0xabc",
+      [],
+      "Lift",
+      0,
+      100,
+      false,
+      topics
+    );
+    const expectation = expect(promise).resolves.toEqual({
+      events: [{ blockNumber: 50 }],
+      actualEnd: 100,
+    });
+    await vi.runAllTimersAsync();
+    await expectation;
+
+    expect(mockQueryFilter).toHaveBeenCalledWith(topics, 0, 100);
+  });
+});
+
+describe("queryLogsWithRetry", () => {
+  const filter = {
+    addresses: ["0xaaa", "0xbbb"],
+    topics: [["0xtopicA", "0xtopicB"]],
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("sends the address list and topic alternatives over the fixed range", async () => {
+    const logs = [{ blockNumber: 12 }];
+    const getLogs = vi.fn().mockResolvedValue(logs);
+    const executeWithFailover = vi.fn((operation) => operation({ getLogs }));
+
+    const promise = queryLogsWithRetry(
+      mockRpc(executeWithFailover),
+      filter,
+      10,
+      20
+    );
+    const expectation = expect(promise).resolves.toBe(logs);
+    await vi.runAllTimersAsync();
+    await expectation;
+
+    expect(getLogs).toHaveBeenCalledWith({
+      address: filter.addresses,
+      topics: filter.topics,
+      fromBlock: 10,
+      toBlock: 20,
+    });
+  });
+
+  it("retries a failing call with the same backoff as a batch", async () => {
+    const executeWithFailover = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("RPC failed: Timeout after 30000ms"))
+      .mockResolvedValueOnce([]);
+
+    const promise = queryLogsWithRetry(
+      mockRpc(executeWithFailover),
+      filter,
+      10,
+      20
+    );
+    const expectation = expect(promise).resolves.toEqual([]);
+    await vi.runAllTimersAsync();
+    await expectation;
+
+    expect(executeWithFailover).toHaveBeenCalledTimes(2);
+  });
+
+  it("gives up and throws after MAX_BATCH_RETRIES failed attempts", async () => {
+    const lastError = new Error("RPC failed: Timeout after 30000ms");
+    const executeWithFailover = vi.fn().mockRejectedValue(lastError);
+
+    const promise = queryLogsWithRetry(
+      mockRpc(executeWithFailover),
+      filter,
+      10,
+      20
+    );
+    const expectation = expect(promise).rejects.toBe(lastError);
+    await vi.runAllTimersAsync();
+    await expectation;
+
+    expect(executeWithFailover).toHaveBeenCalledTimes(MAX_BATCH_RETRIES);
   });
 });
 

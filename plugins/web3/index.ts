@@ -8,11 +8,13 @@ import {
   evmPrivateNetworkField,
   executedCallArgsOutput,
   executedCallContractAddressOutput,
+  executedCallFromOutput,
   executedCallRevertedOutput,
   executedCallSponsoredOutput,
   readFailOnErrorField,
   receiptChainIdOutput,
   solanaNetworkField,
+  sponsorGasField,
   tokenConfigField,
   tokenSymbolOutput,
   transactionLinkOutput,
@@ -279,6 +281,7 @@ const web3Plugin: IntegrationPlugin = {
               networkField: "network",
               actionSlug: "transfer-funds",
             },
+            sponsorGasField(),
           ],
         },
 
@@ -313,6 +316,7 @@ const web3Plugin: IntegrationPlugin = {
         },
         executedCallContractAddressOutput(),
         executedCallArgsOutput(),
+        executedCallFromOutput(),
         executedCallSponsoredOutput(),
         executedCallRevertedOutput(),
         transferErrorOutput(),
@@ -341,6 +345,7 @@ const web3Plugin: IntegrationPlugin = {
               networkField: "network",
               actionSlug: "transfer-token",
             },
+            sponsorGasField(),
           ],
         },
 
@@ -996,6 +1001,82 @@ const web3Plugin: IntegrationPlugin = {
       ],
     },
     {
+      slug: "get-nonce",
+      label: "Get Address Nonce",
+      description:
+        "Get the transaction count (nonce) of any address, with both the mined and pending counts to spot stuck transactions",
+      category: "Web3",
+      stepFunction: "getNonceStep",
+      stepImportPath: "get-nonce",
+      outputFields: [
+        {
+          field: "success",
+          description:
+            "Whether the nonce read succeeded. Also true when failOnError is off and a failed read was softened; the nonce fields are null and `error` is set.",
+        },
+        {
+          field: "nonce",
+          description:
+            "Transaction count at the selected block tag, which is also the next nonce the address will use",
+        },
+        {
+          field: "blockTag",
+          description:
+            "The block tag the nonce was read at (latest or pending)",
+        },
+        {
+          field: "address",
+          description: "The address that was checked",
+        },
+        {
+          field: "latestNonce",
+          description:
+            "Transaction count at the latest block, counting mined transactions only",
+        },
+        {
+          field: "pendingNonce",
+          description:
+            "Transaction count including transactions still waiting in the mempool",
+        },
+        {
+          field: "pendingCount",
+          description:
+            "Transactions submitted but not yet mined (pendingNonce minus latestNonce, never negative). A value that stays above 0 can mean a stuck transaction.",
+        },
+        checkErrorOutput(),
+      ],
+      configFields: [
+        evmNetworkField(),
+        {
+          key: "address",
+          label: "Address",
+          type: "template-input",
+          placeholder: "0x... or {{NodeName.address}}",
+          example: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
+          required: true,
+        },
+        {
+          key: "blockTag",
+          label: "Block Tag",
+          type: "select",
+          options: [
+            {
+              value: "latest",
+              label: "Latest (mined transactions only)",
+            },
+            {
+              value: "pending",
+              label: "Pending (includes mempool transactions)",
+            },
+          ],
+          defaultValue: "latest",
+          helpTip:
+            "Which count the nonce output reports. Both counts are always returned as latestNonce and pendingNonce.",
+        },
+        readFailOnErrorField(),
+      ],
+    },
+    {
       slug: "decode-calldata",
       label: "Decode Calldata",
       description:
@@ -1070,6 +1151,7 @@ const web3Plugin: IntegrationPlugin = {
               key: "abi",
               label: "ABI Override",
               type: "template-textarea",
+              valueFormat: "json",
               placeholder: "Paste ABI JSON to use instead of auto-fetching",
               rows: 4,
             },
@@ -1159,7 +1241,7 @@ const web3Plugin: IntegrationPlugin = {
       slug: "query-events",
       label: "Query Contract Events",
       description:
-        "Query historical smart contract events across a block range with automatic batching",
+        "Query historical smart contract events across a block range with automatic batching, optionally filtered by indexed argument values at the RPC. Can watch several events across several contracts in one node and return them as one merged list.",
       category: "Web3",
       stepFunction: "queryEventsStep",
       stepImportPath: "query-events",
@@ -1172,7 +1254,7 @@ const web3Plugin: IntegrationPlugin = {
         {
           field: "events",
           description:
-            "Array of decoded event objects with blockNumber, transactionHash, logIndex, and args",
+            "Array of decoded event objects with blockNumber, transactionHash, logIndex, and args. With multiple events, each object also carries contractAddress and eventName, and the list is ordered by blockNumber then logIndex across every entry.",
         },
         {
           field: "fromBlock",
@@ -1180,11 +1262,13 @@ const web3Plugin: IntegrationPlugin = {
         },
         {
           field: "toBlock",
-          description: "Actual end block used (resolved from latest)",
+          description:
+            "Actual end block used (resolved from latest). With multiple events, a latest end stops a few blocks behind the head so every entry is scanned through the same block.",
         },
         {
           field: "eventCount",
-          description: "Number of events returned",
+          description:
+            "Number of events returned. Counts events matching the indexed argument filter when one is set, not every occurrence of the event. With multiple events, counts the merged list.",
         },
         {
           field: "error",
@@ -1193,8 +1277,23 @@ const web3Plugin: IntegrationPlugin = {
         },
       ],
       configFields: [
+        {
+          key: "queryMode",
+          label: "Query Mode",
+          type: "select",
+          options: [
+            { value: "single", label: "Single event" },
+            { value: "multiple", label: "Multiple events or contracts" },
+          ],
+          defaultValue: "single",
+          helpTip:
+            "Single event: one contract and one event. Multiple: a list of contract and event pairs on the selected network, each with its own ABI and optional filter, returned as one merged event list.",
+        },
         evmNetworkField(),
-        contractAddressField(),
+        {
+          ...contractAddressField(),
+          showWhen: { field: "queryMode", notEquals: "multiple" },
+        },
         {
           key: "abi",
           label: "Contract ABI",
@@ -1204,6 +1303,7 @@ const web3Plugin: IntegrationPlugin = {
           networkField: "network",
           rows: 6,
           required: true,
+          showWhen: { field: "queryMode", notEquals: "multiple" },
         },
         {
           key: "eventName",
@@ -1212,6 +1312,28 @@ const web3Plugin: IntegrationPlugin = {
           abiField: "abi",
           placeholder: "Select an event",
           required: true,
+          showWhen: { field: "queryMode", notEquals: "multiple" },
+        },
+        {
+          key: "eventArgs",
+          label: "Filter by Indexed Arguments",
+          type: "abi-event-args",
+          abiField: "abi",
+          abiEventField: "eventName",
+          helpTip:
+            "Optional. Filters at the RPC, so only matching logs are fetched. Only indexed parameters can be filtered this way. Omit a parameter to match any value for it.",
+          showWhen: { field: "queryMode", notEquals: "multiple" },
+        },
+        {
+          key: "eventQueries",
+          label: "Events",
+          type: "event-list-builder",
+          required: true,
+          contractInteractionType: "read",
+          networkField: "network",
+          helpTip:
+            "Up to 20 contract and event pairs, all on the network above. Each has its own contract address, ABI, event and optional indexed argument filter. Events without a filter on the same contract share one RPC call.",
+          showWhen: { field: "queryMode", equals: "multiple" },
         },
         {
           type: "group",
@@ -1640,6 +1762,7 @@ const web3Plugin: IntegrationPlugin = {
         },
         executedCallContractAddressOutput(),
         executedCallArgsOutput(),
+        executedCallFromOutput(),
         executedCallSponsoredOutput(),
         executedCallRevertedOutput(),
         {
@@ -1678,6 +1801,7 @@ const web3Plugin: IntegrationPlugin = {
               networkField: "network",
               actionSlug: "approve-token",
             },
+            sponsorGasField(),
           ],
         },
 
@@ -1731,49 +1855,67 @@ const web3Plugin: IntegrationPlugin = {
       ],
     },
     {
-      slug: "check-approval-exploit",
-      label: "Check Approval Exploit List",
+      slug: "check-approval-exploits",
+      label: "Check Known Approval Exploits",
       description:
-        "Check whether the spenders in a set of ERC-20 approvals appear in the Revoke.cash approval exploit list, and return the matching incident details. A spender that is absent from the list is not a safety certificate: the list carries only incidents reported and verified upstream.",
+        "Match supplied token and spender pairs against Revoke.cash's public known approval exploit list on the selected chain. This does not discover approvals, read allowances or Permit2 state, or certify safety; not_listed means only that no match exists in the retrieved list revision.",
       category: "Web3",
-      stepFunction: "checkApprovalExploitStep",
-      stepImportPath: "check-approval-exploit",
+      stepFunction: "checkApprovalExploitsStep",
+      stepImportPath: "check-approval-exploits",
       outputFields: [
         {
           field: "success",
           description:
-            "Whether the check completed. Also true when failOnError is off and a failed list retrieval was softened; the result fields are null and `error` is set.",
+            "Whether the lookup completed. Also true when failOnError is off and a failed lookup was softened; lookupStatus remains error and result fields remain null.",
         },
         {
-          field: "checked",
-          description: "How many approvals were checked",
-        },
-        {
-          field: "matchCount",
-          description: "How many of the spenders appear in the exploit list",
-        },
-        {
-          field: "matches",
+          field: "lookupStatus",
           description:
-            "One entry per matching approval: tokenAddress, spenderAddress, and the incident (name, description, date, amount in millions of USD - the Bancor record's 0.135 is $135k - and metaArticleUrls)",
+            "complete when the full source snapshot was checked, otherwise error",
+        },
+        {
+          field: "results",
+          description:
+            "One result per supplied pair with its input index, token, spender, matched or not_listed status, and every matching incident. Incident amount is historical source data, not the wallet's value at risk.",
+        },
+        {
+          field: "matchedPairCount",
+          description:
+            "Number of supplied pairs whose spender matched at least one incident on the selected chain",
         },
         {
           field: "chainCoverage",
           description:
-            "One entry per chain the upstream list covers: chainId, incidentCount (incidents listing an address on that chain) and listedAddressCount (distinct addresses listed). Read it to tell a chain with nothing listed from a lookup that matched nothing. Null when failOnError is off and a failed list retrieval was softened.",
+            "Coverage of the selected chain in the retrieved source revision: chainId, incidentCount, and unique listedAddressCount. Zero counts mean the source has no entries for that chain, so not_listed provides no chain-specific evidence.",
         },
-        checkErrorOutput(),
+        {
+          field: "source",
+          description:
+            "Revoke.cash exploit-list repository, exact commit revision, and retrieval time",
+        },
+        {
+          field: "coverage",
+          description:
+            "Explicit limits of the lookup, including that not_listed is not a safety verdict",
+        },
+        {
+          field: "error",
+          description:
+            "Error message when lookupStatus is error, including softened failures",
+        },
       ],
       configFields: [
         evmNetworkField(),
         {
-          key: "approvals",
-          label: "Approvals (JSON)",
-          type: "template-textarea",
+          key: "approvalPairs",
+          label: "Token and Spender Pairs",
+          type: "json-editor",
           placeholder:
             '[{"tokenAddress":"0x...","spenderAddress":"0x..."}]',
           example:
-            '[{"tokenAddress":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","spenderAddress":"0x8dFEB86C7C962577deD19AB2050AC78654feA9F7"}]',
+            '[{"tokenAddress":"0x6B175474E89094C44Da98b954EedeAC495271d0F","spenderAddress":"0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"}]',
+          helpTip:
+            "JSON array with 1 to 100 tokenAddress and spenderAddress pairs. Template references may be used inside the JSON string. Token addresses keep results tied to the approval being checked; exploit matching uses spender address plus the selected chain.",
           required: true,
         },
         readFailOnErrorField(),
@@ -1810,6 +1952,7 @@ const web3Plugin: IntegrationPlugin = {
         },
         executedCallContractAddressOutput(),
         executedCallArgsOutput(),
+        executedCallFromOutput(),
         executedCallSponsoredOutput(),
         executedCallRevertedOutput(),
         {
@@ -1881,6 +2024,7 @@ const web3Plugin: IntegrationPlugin = {
               networkField: "network",
               actionSlug: "write-contract",
             },
+            sponsorGasField(),
           ],
         },
 

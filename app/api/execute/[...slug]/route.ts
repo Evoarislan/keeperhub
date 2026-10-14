@@ -6,8 +6,10 @@ import { NextResponse } from "next/server";
 import { resolveAbi } from "@/lib/abi/cache";
 import { enforceExecutionLimit } from "@/lib/billing/execution-guard";
 import { enterApiExecuteErrorContext } from "@/lib/db/org-helpers";
+import { resolvePayableEther } from "@/lib/execute/protocol-eth-value";
 import {
   beginIdempotentFromRequest,
+  dispositionForExecutionOutcome,
   type IdempotencyOutcome,
   idempotencyEarlyResponse,
   recordIdempotentResponse,
@@ -15,11 +17,15 @@ import {
 } from "@/lib/idempotency";
 import { SCOPE_MCP_WRITE } from "@/lib/mcp/oauth-scopes";
 import { requireScope } from "@/lib/middleware/require-scope";
+import { checkProtocolOnchainGuards } from "@/lib/protocol-input-guards-onchain";
 import { getProtocol, resolveContractAddress } from "@/lib/protocol-registry";
 import { applyRateLimitHeaders } from "@/lib/rate-limit-headers";
 import { getChainIdFromNetwork } from "@/lib/rpc/network-utils";
 import { PLUGIN_STEP_IMPORTERS } from "@/lib/step-registry";
-import { resolveProtocolMeta } from "@/plugins/protocol/steps/resolve-protocol-meta";
+import {
+  type ProtocolMeta,
+  resolveProtocolMeta,
+} from "@/plugins/protocol/steps/resolve-protocol-meta";
 import {
   type ReadContractCoreInput,
   readContractCore,
@@ -41,56 +47,19 @@ import {
 import { buildProtocolFunctionArgs } from "../_lib/protocol-function-args";
 import { checkRateLimit } from "../_lib/rate-limit";
 import { parseNativeValueEther } from "../_lib/reserved-value";
+import { refuseSimulateBody, rejectSimulateQuery } from "../_lib/simulate-flag";
 import { checkAndReserveExecution } from "../_lib/spending-cap";
 import type { ExecuteResponse } from "../_lib/types";
 import { requireWallet } from "../_lib/wallet-check";
 
 async function executeProtocolAction(
   actionType: string,
+  chainFreeMeta: ProtocolMeta,
   body: Record<string, unknown>,
   organizationId: string,
   apiKeyId: string,
   idem: IdempotencyOutcome | null
 ): Promise<NextResponse> {
-  const meta = resolveProtocolMeta({ _actionType: actionType });
-  if (!meta) {
-    return recordIdempotentResponse(
-      idem,
-      NextResponse.json(
-        {
-          success: false,
-          error: `Could not resolve protocol metadata for: ${actionType}`,
-        },
-        { status: HttpStatus.BAD_REQUEST }
-      )
-    );
-  }
-
-  const protocol = getProtocol(meta.protocolSlug);
-  if (!protocol) {
-    return recordIdempotentResponse(
-      idem,
-      NextResponse.json(
-        { success: false, error: `Unknown protocol: ${meta.protocolSlug}` },
-        { status: HttpStatus.BAD_REQUEST }
-      )
-    );
-  }
-
-  const contract = protocol.contracts[meta.contractKey];
-  if (!contract) {
-    return recordIdempotentResponse(
-      idem,
-      NextResponse.json(
-        {
-          success: false,
-          error: `Unknown contract key "${meta.contractKey}" in protocol "${meta.protocolSlug}"`,
-        },
-        { status: HttpStatus.BAD_REQUEST }
-      )
-    );
-  }
-
   // KEEP-490: accept `chainId` as the canonical input, with `network` as a
   // deprecated alias. Either field may carry the numeric chain ID (1, 11155111)
   // or a known chain name/slug ("ethereum", "sepolia", "base"). Downstream
@@ -127,6 +96,49 @@ async function executeProtocolAction(
     );
   }
   const network = String(resolvedChainId);
+
+  // The L2 slug aliases are chain-scoped, so the chain has to be normalized
+  // before the action type can be resolved: an integration still calling a
+  // slug the wstETH/sUSDS L2 split renamed binds the L2 contract key here,
+  // matching what the workflow read/write steps do.
+  //
+  // The `??` never fires. The caller only dispatches here after resolving the
+  // same action type without a chain, and the chain steers nothing but
+  // resolveRenamedAction, which returns the declared action unchanged when no
+  // alias applies. Adding a network cannot turn a resolvable action type into
+  // an unresolvable one, so there is no unresolvable case left to answer with
+  // a 400 - an action type that names nothing is already rejected with a 501
+  // by the handler below.
+  const meta =
+    resolveProtocolMeta({ _actionType: actionType, network }) ?? chainFreeMeta;
+
+  const protocol = getProtocol(meta.protocolSlug);
+  if (!protocol) {
+    return recordIdempotentResponse(
+      idem,
+      NextResponse.json(
+        {
+          success: false,
+          error: `Unknown protocol: ${meta.protocolSlug}`,
+        },
+        { status: HttpStatus.BAD_REQUEST }
+      )
+    );
+  }
+
+  const contract = protocol.contracts[meta.contractKey];
+  if (!contract) {
+    return recordIdempotentResponse(
+      idem,
+      NextResponse.json(
+        {
+          success: false,
+          error: `Unknown contract key "${meta.contractKey}" in protocol "${meta.protocolSlug}"`,
+        },
+        { status: HttpStatus.BAD_REQUEST }
+      )
+    );
+  }
 
   const contractAddress = resolveContractAddress(
     contract,
@@ -174,7 +186,10 @@ async function executeProtocolAction(
     body,
     meta.protocolSlug,
     meta.contractKey,
-    meta.functionName
+    meta.functionName,
+    // Normalized above: the body may carry `chainId`, the deprecated `network`
+    // alias, or a chain name, and the guards index addresses by chain id.
+    network
   );
   if (!argsResult.ok) {
     // Pre-broadcast validation: release so the same key can retry with a
@@ -192,7 +207,7 @@ async function executeProtocolAction(
       "release"
     );
   }
-  const { functionArgs } = argsResult;
+  const { functionArgs, payerParam } = argsResult;
 
   if (meta.actionType === "read") {
     const coreInput: ReadContractCoreInput = {
@@ -229,7 +244,26 @@ async function executeProtocolAction(
     return recordIdempotentResponse(idem, walletError, "release");
   }
 
-  const ethValue = body.ethValue ? String(body.ethValue) : undefined;
+  // Read the payable value from the action's declared source (the OFT
+  // send's nativeFee, every other action's ethValue), then run the action's
+  // registered ethValue transform (a value field typed in wei, as
+  // LayerZero's OFT send is) before anything reads the value, so the cap
+  // reservation below and writeContractCore see the same ether string the
+  // workflow step would produce. An action with no transform gets its
+  // value through exactly as before. Refuses, rather than guesses, when the
+  // action cannot be resolved and a value is present.
+  const payableValue = resolvePayableEther(body, meta);
+  if (!payableValue.ok) {
+    return recordIdempotentResponse(
+      idem,
+      NextResponse.json(
+        { success: false, error: payableValue.error },
+        { status: HttpStatus.BAD_REQUEST }
+      ),
+      "release"
+    );
+  }
+  const ethValue = payableValue.value ? String(payableValue.value) : undefined;
   // Charge any native value forwarded by the protocol write against the cap.
   const parsedValue = parseNativeValueEther(ethValue);
   if (!parsedValue.ok) {
@@ -237,6 +271,33 @@ async function executeProtocolAction(
       idem,
       NextResponse.json(
         { success: false, error: parsedValue.error },
+        { status: HttpStatus.BAD_REQUEST }
+      ),
+      "release"
+    );
+  }
+
+  // Guards that need a round trip. Placed just above the first gate that
+  // costs the caller anything: the limit and concurrency checks above only
+  // read counters and answer 429, so an org already at its limit should get
+  // that answer without this endpoint issuing an ownerOf read per request.
+  // Shared with the workflow write step.
+  const onchainGuard = await checkProtocolOnchainGuards({
+    protocolSlug: meta.protocolSlug,
+    functionName: meta.functionName,
+    inputs: body,
+    network,
+    organizationId,
+  });
+  if (!onchainGuard.ok) {
+    return recordIdempotentResponse(
+      idem,
+      NextResponse.json(
+        {
+          success: false,
+          error: onchainGuard.error,
+          field: onchainGuard.field,
+        },
         { status: HttpStatus.BAD_REQUEST }
       ),
       "release"
@@ -272,6 +333,7 @@ async function executeProtocolAction(
     abiFunction: meta.functionName,
     functionArgs,
     ethValue,
+    payerParam,
     _context: { organizationId },
   };
   const result = await withIdempotencyHeartbeat(idem, () =>
@@ -300,6 +362,7 @@ async function executeProtocolAction(
       transactionHash: result.transactionHash,
       chainId: result.chainId,
       sponsored: result.sponsored,
+      broadcastAttempted: result.broadcastAttempted,
       transactionLink: result.transactionLink,
       rejection: result.rejection,
       errorClass: result.errorClass,
@@ -338,12 +401,12 @@ async function executeProtocolAction(
       : {}),
   };
 
-  // The tx reached the broadcast path, so finalize as success or failed and
-  // never release: a retry on the same key must not re-broadcast.
+  const disposition = dispositionForExecutionOutcome(outcome.status, result);
+
   return recordIdempotentResponse(
     idem,
     NextResponse.json(responseBody, { status: HttpStatus.ACCEPTED }),
-    outcome.status === "completed" ? "success" : "failed"
+    disposition
   );
 }
 
@@ -375,6 +438,13 @@ export async function POST(
       { error: apiKeyCtx.error },
       { status: apiKeyCtx.status }
     );
+  }
+
+  // #2004: ?simulate= is refused on every /api/execute/* route rather than
+  // silently ignored.
+  const simulateQuery = rejectSimulateQuery(request);
+  if (simulateQuery) {
+    return simulateQuery;
   }
 
   const scopeError = requireScope(apiKeyCtx.scope, SCOPE_MCP_WRITE, {
@@ -411,6 +481,16 @@ export async function POST(
     );
   }
 
+  // #2004 (the severe half): this route has no dry-run support, and a body
+  // `simulate` used to fall through as an unknown field while the protocol
+  // action broadcast for real (issue #1929). Refuse it loudly, before the
+  // idempotency key is reserved so a refused request consumes no execution
+  // and leaves no lock to release.
+  const simulateBody = refuseSimulateBody(body);
+  if (simulateBody) {
+    return simulateBody;
+  }
+
   const idem = await beginIdempotentFromRequest({
     request,
     organizationId: apiKeyCtx.organizationId,
@@ -433,6 +513,7 @@ export async function POST(
     if (meta) {
       const response = await executeProtocolAction(
         actionType,
+        meta,
         body,
         apiKeyCtx.organizationId,
         apiKeyCtx.apiKeyId,

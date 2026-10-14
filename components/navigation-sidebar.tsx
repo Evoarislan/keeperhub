@@ -4,7 +4,6 @@ import {
   Activity,
   BarChart3,
   Bookmark,
-  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Clock,
@@ -18,7 +17,7 @@ import {
   X,
 } from "lucide-react";
 import { useParams, usePathname, useRouter } from "next/navigation";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useAuthPrompt } from "@/components/auth/provider";
 import { DiscordIcon } from "@/components/icons/discord-icon";
@@ -32,22 +31,21 @@ import {
 } from "@/components/ui/tooltip";
 import { TruncatedTooltip } from "@/components/ui/truncated-tooltip";
 import { useIsMobile } from "@/hooks/use-mobile";
-import type { Project, SavedWorkflow, Tag } from "@/lib/api-client";
+import type { Project, SavedWorkflow } from "@/lib/api-client";
 import { api } from "@/lib/api-client";
 import { authClient, useSession } from "@/lib/auth-client";
+import { isEscapeFromOverlay, isEscapeHandled } from "@/lib/escape-key";
 import { useProjects, useTags } from "@/lib/hooks/use-org-data";
 import { useActiveMember } from "@/lib/hooks/use-organization";
 import type { NavPanelStates } from "@/lib/hooks/use-persisted-nav-state";
 import { usePersistedNavState } from "@/lib/hooks/use-persisted-nav-state";
 import { isAnonymousUser } from "@/lib/is-anonymous";
+import { createLatestRequest } from "@/lib/latest-request";
 import { registerSidebarRefetch } from "@/lib/refetch-sidebar";
 import { cn } from "@/lib/utils";
 import { filterPickerVisible } from "@/lib/workflow/soft-delete";
-import {
-  getWorkflowTriggerType,
-  shouldShowDisabledBadge,
-  type WorkflowTriggerType,
-} from "@/lib/workflow/store";
+import { getPickerTriggerType } from "@/lib/workflow/trigger-display";
+import { getTriggerConfig } from "@/lib/workflow/trigger-display-key";
 import { FLYOUT_WIDTH, FlyoutPanel, STRIP_WIDTH } from "./flyout-panel";
 import {
   ACTION_ITEM_IDS,
@@ -56,33 +54,22 @@ import {
   type NavItemId,
   SETTINGS_NAV_ITEM_DATA,
 } from "./navigation/nav-items-data";
+import {
+  applyPickerFilter,
+  PickerFilterButton,
+  PickerFilterRow,
+  usePickerFilter,
+} from "./workflow-picker-filter";
+import {
+  FilteredEmpty,
+  TagsPanel,
+  type WorkflowEntry,
+  WorkflowItem,
+} from "./workflow-picker-list";
 
 export const COLLAPSED_WIDTH = 60;
 export const EXPANDED_WIDTH = 200;
 const SNAP_THRESHOLD = (COLLAPSED_WIDTH + EXPANDED_WIDTH) / 2;
-
-type WorkflowEntry = {
-  id: string;
-  name: string;
-  updatedAt: string;
-  projectId?: string | null;
-  tagId?: string | null;
-  // Soft-delete timestamp. The list route already excludes these rows;
-  // filterPickerVisible() re-checks it so a stale cached payload cannot put
-  // one back in the picker.
-  deletedAt?: string | null;
-  // The trigger type drives whether the "Disabled" label is meaningful --
-  // see shouldShowDisabledBadge. Derived once at the SavedWorkflow boundary
-  // so WorkflowItem doesn't have to carry the full nodes payload.
-  triggerType?: WorkflowTriggerType;
-  // When false on a trigger that supports the enable switch, the picker
-  // greys the row out and tags it "Disabled" without strikethrough. The row
-  // stays selectable.
-  enabled?: boolean;
-  // Set by ops via admin API. Takes precedence over the "Disabled" label —
-  // the user cannot clear this themselves.
-  deactivatedAt?: string | null;
-};
 
 function groupWorkflows(workflows: WorkflowEntry[]): {
   byProject: Record<string, WorkflowEntry[]>;
@@ -105,46 +92,9 @@ function groupWorkflows(workflows: WorkflowEntry[]): {
   return { byProject, ungrouped };
 }
 
-function WorkflowItem({
-  workflow,
-  activeWorkflowId,
-}: {
-  workflow: WorkflowEntry;
-  activeWorkflowId: string | undefined;
-}): React.ReactNode {
-  const router = useRouter();
-  const isDeactivated = !!workflow.deactivatedAt;
-  const showDisabled = !isDeactivated && shouldShowDisabledBadge(workflow);
-  const isActive = workflow.id === activeWorkflowId;
-  return (
-    <button
-      className={cn(
-        "flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-muted",
-        isActive && "bg-muted"
-      )}
-      onClick={() => router.push(`/workflows/${workflow.id}`)}
-      type="button"
-    >
-      <TruncatedTooltip
-        className={cn(
-          (isDeactivated || showDisabled) && "text-muted-foreground"
-        )}
-        side="right"
-        text={workflow.name}
-      />
-      {isDeactivated && (
-        <span className="ml-2 shrink-0 text-muted-foreground text-xs">
-          Deactivated
-        </span>
-      )}
-      {showDisabled && (
-        <span className="ml-2 shrink-0 text-muted-foreground text-xs">
-          Disabled
-        </span>
-      )}
-    </button>
-  );
-}
+// The rows of filter menus in the Workflows panel and in a project's panel.
+const ROOT_FILTER_ROW_ID = "workflow-root-filter";
+const PROJECT_FILTER_ROW_ID = "workflow-project-filter";
 
 function computePanelOffsets(
   sidebarWidth: number,
@@ -179,21 +129,31 @@ function computePanelOffsets(
 function ProjectsPanel({
   projects,
   ungrouped,
+  ungroupedTotal,
   byProject,
   activeWorkflowId,
   selectedProjectId,
   onSelectProject,
   loading,
   isAnonymous,
+  onResetFilter,
+  filteredEmptyText,
 }: {
   projects: Project[];
+  // The workflows outside any project that the filter lets through ...
   ungrouped: WorkflowEntry[];
+  // ... and how many there are before filtering.
+  ungroupedTotal: number;
   byProject: Record<string, WorkflowEntry[]>;
   activeWorkflowId: string | undefined;
   selectedProjectId: string | null;
   onSelectProject: (id: string) => void;
   loading: boolean;
   isAnonymous: boolean;
+  // Set while a trigger filter narrows the workflows outside any project;
+  // the filter leaves the project list as it is.
+  onResetFilter?: () => void;
+  filteredEmptyText: string;
 }): React.ReactNode {
   if (loading) {
     return (
@@ -203,7 +163,7 @@ function ProjectsPanel({
     );
   }
 
-  const hasAny = projects.length > 0 || ungrouped.length > 0;
+  const hasAny = projects.length > 0 || ungroupedTotal > 0;
 
   if (!hasAny) {
     return (
@@ -226,7 +186,7 @@ function ProjectsPanel({
         return (
           <button
             className={cn(
-              "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-muted",
+              "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-muted outline-none focus-visible:ring-2 focus-visible:ring-foreground/60 focus-visible:ring-inset",
               isActive && "bg-muted"
             )}
             key={project.id}
@@ -248,7 +208,7 @@ function ProjectsPanel({
         );
       })}
 
-      {ungrouped.length > 0 && (
+      {ungroupedTotal > 0 && (
         <>
           {projects.length > 0 && (
             <>
@@ -265,141 +225,15 @@ function ProjectsPanel({
               workflow={w}
             />
           ))}
+          {ungrouped.length === 0 && onResetFilter && (
+            <FilteredEmpty onReset={onResetFilter} text={filteredEmptyText} />
+          )}
         </>
       )}
       {isAnonymous && hasAny && (
         <p className="mt-2 border-t px-2 pt-2 text-center text-muted-foreground/70 text-xs">
           Sign in to create more
         </p>
-      )}
-    </div>
-  );
-}
-
-const UNTAGGED_KEY = "__untagged__";
-
-function TagsPanel({
-  projectTags,
-  workflowsByTagId,
-  untaggedWorkflows,
-  activeWorkflowId,
-  loading,
-}: {
-  projectTags: Tag[];
-  workflowsByTagId: Record<string, WorkflowEntry[]>;
-  untaggedWorkflows: WorkflowEntry[];
-  activeWorkflowId: string | undefined;
-  loading: boolean;
-}): React.ReactNode {
-  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
-
-  const toggle = (key: string): void => {
-    setCollapsed((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) {
-        next.delete(key);
-      } else {
-        next.add(key);
-      }
-      return next;
-    });
-  };
-
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center py-8">
-        <Loader2 className="size-5 animate-spin text-muted-foreground" />
-      </div>
-    );
-  }
-
-  const hasAny = projectTags.length > 0 || untaggedWorkflows.length > 0;
-
-  if (!hasAny) {
-    return (
-      <p className="py-4 text-center text-muted-foreground text-sm">
-        No workflows
-      </p>
-    );
-  }
-
-  return (
-    <div className="flex flex-col gap-0.5">
-      {projectTags.map((tag, index) => {
-        const tagWorkflows = workflowsByTagId[tag.id] ?? [];
-        const isCollapsed = collapsed.has(tag.id);
-        return (
-          <div className="flex flex-col gap-0.5" key={tag.id}>
-            {index > 0 && <div className="my-1 border-t" />}
-            <button
-              aria-expanded={!isCollapsed}
-              className="flex w-full items-center gap-2 rounded-md px-2 pt-1 pb-1.5 text-left font-medium text-muted-foreground text-xs uppercase tracking-wider transition-colors hover:bg-muted hover:text-foreground"
-              onClick={() => toggle(tag.id)}
-              type="button"
-            >
-              {isCollapsed ? (
-                <ChevronRight className="size-3 shrink-0" />
-              ) : (
-                <ChevronDown className="size-3 shrink-0" />
-              )}
-              <span
-                className="inline-block size-2 shrink-0 rounded-full"
-                style={{ backgroundColor: tag.color }}
-              />
-              <TruncatedTooltip side="right" text={tag.name} />
-              <span className="ml-auto normal-case tracking-normal">
-                {tag.workflowCount}
-              </span>
-            </button>
-            {!isCollapsed &&
-              tagWorkflows.map((w) => (
-                <WorkflowItem
-                  activeWorkflowId={activeWorkflowId}
-                  key={w.id}
-                  workflow={w}
-                />
-              ))}
-          </div>
-        );
-      })}
-      {untaggedWorkflows.length > 0 && (
-        <>
-          {projectTags.length > 0 && <div className="my-1 border-t" />}
-          {(() => {
-            const showHeader = projectTags.length > 0;
-            const isCollapsed = showHeader && collapsed.has(UNTAGGED_KEY);
-            return (
-              <>
-                {showHeader && (
-                  <button
-                    aria-expanded={!isCollapsed}
-                    className="flex w-full items-center gap-2 rounded-md px-2 pt-1 pb-1.5 text-left font-medium text-muted-foreground text-xs uppercase tracking-wider transition-colors hover:bg-muted hover:text-foreground"
-                    onClick={() => toggle(UNTAGGED_KEY)}
-                    type="button"
-                  >
-                    {isCollapsed ? (
-                      <ChevronRight className="size-3 shrink-0" />
-                    ) : (
-                      <ChevronDown className="size-3 shrink-0" />
-                    )}
-                    <span className="truncate">Untagged</span>
-                    <span className="ml-auto normal-case tracking-normal">
-                      {untaggedWorkflows.length}
-                    </span>
-                  </button>
-                )}
-                {!isCollapsed &&
-                  untaggedWorkflows.map((w) => (
-                    <WorkflowItem
-                      activeWorkflowId={activeWorkflowId}
-                      key={w.id}
-                      workflow={w}
-                    />
-                  ))}
-              </>
-            );
-          })()}
-        </>
       )}
     </div>
   );
@@ -579,16 +413,45 @@ export function NavigationSidebar(): React.ReactNode {
   const { data: projects } = useProjects();
   const { data: tags } = useTags();
   const [dataLoading, setDataLoading] = useState(true);
+  // Each panel filters its own list: the Workflows panel the workflows
+  // outside any project, a project's panel that project's workflows.
+  const rootFilter = usePickerFilter(navState.state.panels.projects);
+  const projectFilter = usePickerFilter(navState.state.panels.tags);
+  // A reply that lands after a newer list request was sent is dropped rather
+  // than put back over the newer list.
+  const latestFetch = useRef(createLatestRequest());
+  // The organization the session is in, and the one the shown list was
+  // loaded for. A failed fetch keeps the shown list only while they match.
+  const sessionOrg = useRef<string | null>(null);
+  const listOrg = useRef<string | null>(null);
   const isDragging = useRef(false);
   const sidebarRef = useRef<HTMLDivElement>(null);
 
-  const fetchData = useCallback(async (): Promise<void> => {
-    try {
-      setWorkflows(await api.workflow.getAll().catch(() => []));
-    } finally {
+  const fetchData = useCallback(
+    async (options?: { clearOnFailure?: boolean }): Promise<void> => {
+      const result = await latestFetch.current(() => api.workflow.getAll());
+      // Only the latest request settles the list and the loading state.
+      if (!result.latest) {
+        return;
+      }
+      if (result.ok) {
+        setWorkflows(result.value);
+        // The org is read on reply: a reply sent before an org switch is
+        // never the latest, as the session refresh sends a newer one.
+        listOrg.current = sessionOrg.current;
+      } else if (
+        options?.clearOnFailure ||
+        sessionOrg.current !== listOrg.current
+      ) {
+        // A failed refetch keeps the list already shown, unless it belongs
+        // to another organization. A failed first load leaves it empty.
+        setWorkflows([]);
+        listOrg.current = sessionOrg.current;
+      }
       setDataLoading(false);
-    }
-  }, []);
+    },
+    []
+  );
 
   useEffect(() => {
     // NAV-04: gate fetchData on session resolution. While pending, do nothing
@@ -602,10 +465,18 @@ export function NavigationSidebar(): React.ReactNode {
       setDataLoading(false);
       return;
     }
+    // Every org switch refreshes the session, whichever code path made it.
+    sessionOrg.current =
+      (session.session as { activeOrganizationId?: string | null })
+        .activeOrganizationId ?? null;
     fetchData().catch(() => {
       /* intentional noop */
     });
   }, [isPending, session, fetchData]);
+
+  const clearRootFilter = rootFilter.clear;
+  const showAllRootWorkflows = rootFilter.showAll;
+  const clearProjectFilter = projectFilter.clear;
 
   useEffect(
     () =>
@@ -613,11 +484,26 @@ export function NavigationSidebar(): React.ReactNode {
         if (options?.closeFlyout) {
           navState.closeAll();
         }
-        fetchData().catch(() => {
+        // An org switch keeps the panels open; a filter belongs to the
+        // workflows it was set on.
+        if (options?.orgChanged) {
+          clearRootFilter();
+          clearProjectFilter();
+        }
+        if (options?.workflowCreated) {
+          showAllRootWorkflows();
+        }
+        fetchData({ clearOnFailure: options?.orgChanged }).catch(() => {
           /* intentional noop */
         });
       }),
-    [fetchData, navState.closeAll]
+    [
+      fetchData,
+      navState.closeAll,
+      clearRootFilter,
+      clearProjectFilter,
+      showAllRootWorkflows,
+    ]
   );
 
   // Validate persisted selections after data loads
@@ -632,10 +518,22 @@ export function NavigationSidebar(): React.ReactNode {
 
   const isAnonymous = isAnonymousUser(session?.user);
 
-  const visibleWorkflows = filterPickerVisible(workflows).map((w) => ({
-    ...w,
-    triggerType: getWorkflowTriggerType(w.nodes),
-  }));
+  // A save that changes a workflow's trigger refetches the list (see
+  // refetchSidebarIfTriggerChanged), so the rows read it from the fetched
+  // nodes. Built once per fetch, so the rows (memoized) skip the trigger
+  // labels and cron parsing on unrelated re-renders such as a drag-resize.
+  const visibleWorkflows = useMemo(
+    () =>
+      filterPickerVisible(workflows).map((w) => {
+        const triggerConfig = getTriggerConfig(w.nodes);
+        return {
+          ...w,
+          triggerConfig,
+          triggerType: getPickerTriggerType(triggerConfig),
+        };
+      }),
+    [workflows]
+  );
 
   const workflowId =
     typeof params.workflowId === "string" ? params.workflowId : undefined;
@@ -707,7 +605,14 @@ export function NavigationSidebar(): React.ReactNode {
     }
 
     function handleKeyDown(e: KeyboardEvent): void {
-      if (e.key === "Escape") {
+      // A control that used this Escape itself (a filter menu closing, a
+      // filter button hiding the row) tags it; that step is all it does.
+      // Likewise an Escape that closes a dialog, menu or select.
+      if (
+        e.key === "Escape" &&
+        !isEscapeHandled(e) &&
+        !isEscapeFromOverlay(e)
+      ) {
         navState.peelRightmost();
       }
     }
@@ -749,7 +654,12 @@ export function NavigationSidebar(): React.ReactNode {
   const { byProject, ungrouped } = groupWorkflows(visibleWorkflows);
   const selectedProjectId = navState.state.selectedProjectId;
   const selectedProject = projects.find((p) => p.id === selectedProjectId);
-  const projectWorkflows = byProject[selectedProjectId ?? ""] ?? [];
+  const allProjectWorkflows = byProject[selectedProjectId ?? ""] ?? [];
+  const projectWorkflows = applyPickerFilter(
+    allProjectWorkflows,
+    projectFilter
+  );
+  const shownUngrouped = applyPickerFilter(ungrouped, rootFilter);
   const projectTagIds = new Set(
     projectWorkflows.filter((w) => w.tagId).map((w) => w.tagId)
   );
@@ -824,6 +734,9 @@ export function NavigationSidebar(): React.ReactNode {
         nodes: [],
         edges: [],
       });
+      // Same as refetchSidebar({ workflowCreated: true }), awaited so the
+      // list holds the new workflow before the panel opens on it.
+      showAllRootWorkflows();
       await fetchData();
       navState.setPanelState("projects", "open");
       sessionStorage.setItem("animate-sidebar", "true");
@@ -836,6 +749,9 @@ export function NavigationSidebar(): React.ReactNode {
       nodes: [],
       edges: [],
     });
+    // Same as refetchSidebar({ workflowCreated: true }), awaited so the
+    // list holds the new workflow before the panel opens on it.
+    showAllRootWorkflows();
     await fetchData();
     navState.setPanelState("projects", "open");
     sessionStorage.setItem("animate-sidebar", "true");
@@ -887,6 +803,8 @@ export function NavigationSidebar(): React.ReactNode {
     navState.setSelectedTag(null);
     navState.setPanelState("tags", "open");
     navState.setPanelState("workflows", "closed");
+    // A filter belongs to the project it was set in.
+    clearProjectFilter();
   }
 
   // NAV-01: render every nav item for everyone (anonymous, signed-out, signed-in).
@@ -1022,21 +940,43 @@ export function NavigationSidebar(): React.ReactNode {
         collapsedLabel={
           selectedProject ? `Workflows - ${selectedProject.name}` : "Workflows"
         }
+        headerLeading={
+          <PickerFilterButton
+            filter={rootFilter}
+            hasWorkflows={ungrouped.length > 0}
+            loading={dataLoading}
+            panelId={ROOT_FILTER_ROW_ID}
+            panelName="Workflows"
+          />
+        }
         leftOffset={offsets.projects}
         onCollapse={() => navState.setPanelState("projects", "collapsed")}
         onExpand={() => navState.setPanelState("projects", "open")}
         state={navState.state.panels.projects}
         title="Workflows"
       >
+        <PickerFilterRow
+          filter={rootFilter}
+          loading={dataLoading}
+          panelId={ROOT_FILTER_ROW_ID}
+          panelName="Workflows"
+          shownCount={shownUngrouped.length}
+          workflows={ungrouped}
+        />
         <ProjectsPanel
           activeWorkflowId={workflowId}
           byProject={byProject}
+          // The project rows above are not filtered, so the message says
+          // which workflows it is about.
+          filteredEmptyText={`${rootFilter.emptyText} outside a project`}
           isAnonymous={isAnonymous}
           loading={dataLoading}
+          onResetFilter={rootFilter.isFiltered ? rootFilter.reset : undefined}
           onSelectProject={handleSelectProject}
           projects={projects}
           selectedProjectId={selectedProjectId}
-          ungrouped={ungrouped}
+          ungrouped={shownUngrouped}
+          ungroupedTotal={ungrouped.length}
         />
       </FlyoutPanel>
 
@@ -1045,15 +985,37 @@ export function NavigationSidebar(): React.ReactNode {
         collapsedLabel={
           selectedProject ? `Projects - ${selectedProject.name}` : "Projects"
         }
+        headerLeading={
+          <PickerFilterButton
+            filter={projectFilter}
+            hasWorkflows={allProjectWorkflows.length > 0}
+            loading={dataLoading}
+            panelId={PROJECT_FILTER_ROW_ID}
+            panelName={selectedProject?.name ?? "Projects"}
+          />
+        }
         leftOffset={offsets.tags}
         onCollapse={() => navState.setPanelState("tags", "collapsed")}
         onExpand={() => navState.setPanelState("tags", "open")}
         state={navState.state.panels.tags}
         title={selectedProject?.name ?? "Projects"}
       >
+        <PickerFilterRow
+          filter={projectFilter}
+          loading={dataLoading}
+          panelId={PROJECT_FILTER_ROW_ID}
+          panelName={selectedProject?.name ?? "Projects"}
+          shownCount={projectWorkflows.length}
+          workflows={allProjectWorkflows}
+        />
         <TagsPanel
           activeWorkflowId={workflowId}
+          expandAll={projectFilter.isFiltered}
+          filteredEmptyText={projectFilter.emptyText}
           loading={dataLoading}
+          onResetFilter={
+            projectFilter.isFiltered ? projectFilter.reset : undefined
+          }
           projectTags={projectTagsWithCounts}
           untaggedWorkflows={untaggedWorkflows}
           workflowsByTagId={projectWorkflowsByTagId}

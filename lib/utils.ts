@@ -5,6 +5,15 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+// Node reports a failed multi-address connect as an AggregateError with an
+// empty message and one error per address tried.
+function describeCause(cause: Error): string {
+  if (cause.message === "" && cause instanceof AggregateError) {
+    return cause.errors.map((inner) => getErrorMessage(inner)).join("; ");
+  }
+  return cause.message;
+}
+
 /**
  * Extract a meaningful error message from various error types.
  * Handles Error instances, objects with message/error properties, strings,
@@ -21,7 +30,7 @@ export function getErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     // Some errors have a cause property with more details
     if (error.cause && error.cause instanceof Error) {
-      return `${error.message}: ${error.cause.message}`;
+      return `${error.message}: ${describeCause(error.cause)}`;
     }
     return error.message;
   }
@@ -109,6 +118,17 @@ export function getErrorMessage(error: unknown): string {
 }
 
 /**
+ * Resolve a default-on boolean config flag. Only an explicit `false` - the
+ * boolean, or the "false" string the visual editor may persist - turns it
+ * off; anything else, an absent value included, reads as on. Every toggle
+ * that ships default-on resolves through here so they all read a stored
+ * value the same way.
+ */
+export function resolveDefaultOnFlag(value: unknown): boolean {
+  return value !== false && value !== "false";
+}
+
+/**
  * Resolve a "fail workflow on error" config flag. Defaults to true (a failure
  * fails the step); only an explicit `false` (boolean or the "false" string
  * the visual editor may persist) opts into soft-fail. Shared by any step that
@@ -116,7 +136,7 @@ export function getErrorMessage(error: unknown): string {
  * semantics stay identical everywhere it appears.
  */
 export function resolveFailOnError(failOnError: unknown): boolean {
-  return failOnError !== false && failOnError !== "false";
+  return resolveDefaultOnFlag(failOnError);
 }
 
 /**
@@ -397,4 +417,18 @@ export function deserializeTriggerInput(
     return deserialized;
   }
   return triggerInput;
+}
+
+/**
+ * A copy of the set with the value added, or taken out if it was there. For
+ * multi-pick filters and toggled groups; the set it is given is not changed.
+ */
+export function toggleInSet<T>(set: ReadonlySet<T>, value: T): Set<T> {
+  const next = new Set(set);
+  if (next.has(value)) {
+    next.delete(value);
+  } else {
+    next.add(value);
+  }
+  return next;
 }

@@ -18,6 +18,7 @@ export enum WorkflowTriggerEnum {
   EVENT = "Event", // keeperhub custom field //
   BLOCK = "Block", // keeperhub custom field //
   TEMPO_PAYMENT = "Transfer", // keeperhub custom field //
+  PYTH_PRICE = "Pyth Price",
 }
 
 export type WorkflowTriggerType = `${WorkflowTriggerEnum}`;
@@ -30,6 +31,7 @@ export function shouldShowEnableSwitch(
   triggerType: WorkflowTriggerType | undefined
 ): boolean {
   return (
+    triggerType === WorkflowTriggerEnum.PYTH_PRICE ||
     triggerType === WorkflowTriggerEnum.EVENT ||
     triggerType === WorkflowTriggerEnum.SCHEDULE ||
     triggerType === WorkflowTriggerEnum.BLOCK ||
@@ -39,40 +41,25 @@ export function shouldShowEnableSwitch(
 }
 
 /**
- * Pull the trigger type off the trigger node in a workflow's node list.
- * Used by surfaces that need to gate behavior on what fires the workflow
- * without dragging the full editor store into view -- e.g. the sidebar
- * picker deciding whether to surface a "Disabled" label.
+ * The trigger type held in a trigger node's config. Pair with
+ * getTriggerConfig (lib/workflow/trigger-display-key) to read it off a node list.
  */
-export function getWorkflowTriggerType(
-  nodes: Array<{ data?: { type?: string; config?: Record<string, unknown> } }>
+export function getTriggerTypeFromConfig(
+  config: Record<string, unknown> | undefined
 ): WorkflowTriggerType | undefined {
-  const triggerNode = nodes.find((node) => node.data?.type === "trigger");
-  const raw = triggerNode?.data?.config?.triggerType;
-  if (typeof raw !== "string") {
-    return undefined;
-  }
-  // "Scheduled" is a legacy spelling that still lives in some workflow rows;
-  // executor / metrics / mcp normalize it the same way before comparing.
-  const normalized = raw === "Scheduled" ? "Schedule" : raw;
-  return normalized as WorkflowTriggerType;
+  const raw = config?.triggerType;
+  // Anything unrecognized has no trigger to show, like no type at all. That
+  // includes the legacy "Scheduled" spelling: the schedule service accepts
+  // only "Schedule", so a "Scheduled" workflow never gets a schedule and must
+  // not read as a running one.
+  return typeof raw === "string" && TRIGGER_TYPES.has(raw)
+    ? (raw as WorkflowTriggerType)
+    : undefined;
 }
 
-/**
- * Show the "Disabled" label in the sidebar picker only when the workflow has
- * a trigger type whose schedule the user can actually flip with the enable
- * switch. Manual workflows persist `enabled = false` by default but can't be
- * disabled through the UI -- labeling them would be noise.
- */
-export function shouldShowDisabledBadge(workflow: {
-  enabled?: boolean | null;
-  triggerType?: WorkflowTriggerType | null;
-}): boolean {
-  if (workflow.enabled !== false) {
-    return false;
-  }
-  return shouldShowEnableSwitch(workflow.triggerType ?? undefined);
-}
+const TRIGGER_TYPES: ReadonlySet<string> = new Set(
+  Object.values(WorkflowTriggerEnum)
+);
 
 export type WorkflowNodeData = {
   label: string;
@@ -693,8 +680,8 @@ export const loadWorkflowAtom = atom(null, async (get, set) => {
       // Guard: only apply if the workflow hasn't changed by the time data arrives.
       const workflowId = workflow.id;
       api.workflow
-        .getExecutions(workflowId)
-        .then((executions) => {
+        .getExecutions(workflowId, { limit: 1 })
+        .then(({ executions }) => {
           const latest = executions[0];
           if (!latest?.id) {
             return;

@@ -1,15 +1,6 @@
 "use client";
 
-import {
-  ArrowDownToLine,
-  Box,
-  Boxes,
-  Clock,
-  Copy,
-  ExternalLink,
-  Play,
-  Webhook,
-} from "lucide-react";
+import { Copy, ExternalLink } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -25,12 +16,24 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { TimezoneSelect } from "@/components/ui/timezone-select";
+import { getTriggerIcon } from "@/components/workflow-trigger-icons";
+import { useFeatures } from "@/hooks/use-features";
 import { parseIntervalSeconds } from "@/lib/cron-utils";
 import { parseSchemaFields } from "@/lib/schema-fields";
 import type { ActionConfigField } from "@/plugins/registry";
 import { ActionConfigRenderer } from "./action-config-renderer";
 import { CronScheduleBuilder } from "./cron-schedule-builder";
 import { SchemaBuilder } from "./schema-builder";
+import { PythTriggerConfig } from "./pyth-trigger-config";
+
+function TriggerOptionIcon({
+  triggerType,
+}: {
+  triggerType: string;
+}): React.ReactNode {
+  const Icon = getTriggerIcon(triggerType);
+  return <Icon className="h-4 w-4" />;
+}
 
 type TriggerConfigProps = {
   config: Record<string, unknown>;
@@ -45,6 +48,9 @@ export function TriggerConfig({
   disabled,
   workflowId,
 }: TriggerConfigProps) {
+  const { snapshot: featureSnapshot } = useFeatures();
+  const pythPriceTriggerEnabled =
+    featureSnapshot?.pythPriceTriggerEnabled === true;
   const webhookUrl = workflowId
     ? `${typeof window !== "undefined" ? window.location.origin : ""}/api/workflows/${workflowId}/webhook`
     : "";
@@ -83,39 +89,47 @@ export function TriggerConfig({
             <SelectValue placeholder="Select trigger type" />
           </SelectTrigger>
           <SelectContent>
+            {pythPriceTriggerEnabled && (
+              <SelectItem value="Pyth Price">
+                <div className="flex items-center gap-2">
+                  <TriggerOptionIcon triggerType="Pyth Price" />
+                  Pyth Price
+                </div>
+              </SelectItem>
+            )}
             <SelectItem value="Manual">
               <div className="flex items-center gap-2">
-                <Play className="h-4 w-4" />
+                <TriggerOptionIcon triggerType="Manual" />
                 Manual
               </div>
             </SelectItem>
             <SelectItem value="Schedule">
               <div className="flex items-center gap-2">
-                <Clock className="h-4 w-4" />
+                <TriggerOptionIcon triggerType="Schedule" />
                 Schedule
               </div>
             </SelectItem>
             <SelectItem value="Webhook">
               <div className="flex items-center gap-2">
-                <Webhook className="h-4 w-4" />
+                <TriggerOptionIcon triggerType="Webhook" />
                 Webhook
               </div>
             </SelectItem>
             <SelectItem value="Event">
               <div className="flex items-center gap-2">
-                <Boxes className="h-4 w-4" />
+                <TriggerOptionIcon triggerType="Event" />
                 Event
               </div>
             </SelectItem>
             <SelectItem value="Block">
               <div className="flex items-center gap-2">
-                <Box className="h-4 w-4" />
+                <TriggerOptionIcon triggerType="Block" />
                 Block
               </div>
             </SelectItem>
             <SelectItem value="Transfer">
               <div className="flex items-center gap-2">
-                <ArrowDownToLine className="h-4 w-4" />
+                <TriggerOptionIcon triggerType="Transfer" />
                 Transfer
               </div>
             </SelectItem>
@@ -123,6 +137,9 @@ export function TriggerConfig({
         </Select>
       </div>
 
+      {pythPriceTriggerEnabled && config?.triggerType === "Pyth Price" && (
+        <PythTriggerConfig config={config} disabled={disabled} onUpdateConfig={onUpdateConfig} />
+      )}
       {/* Webhook fields */}
       {config?.triggerType === "Webhook" && (
         <>

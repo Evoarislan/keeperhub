@@ -94,16 +94,23 @@ const recordIdempotentResponseMock = vi.fn(
   (_outcome: unknown, response: Response, _disposition?: string) =>
     Promise.resolve(response)
 );
-vi.mock("@/lib/idempotency", () => ({
-  beginIdempotentFromRequest: vi.fn().mockResolvedValue({ kind: "proceed" }),
-  idempotencyEarlyResponse: vi.fn().mockReturnValue(null),
-  recordIdempotentResponse: (
-    outcome: unknown,
-    response: Response,
-    disposition?: string
-  ) => recordIdempotentResponseMock(outcome, response, disposition),
-  withIdempotencyHeartbeat: (_outcome: unknown, fn: () => unknown) => fn(),
-}));
+vi.mock("@/lib/idempotency", async () => {
+  const { dispositionForExecutionOutcome } = await vi.importActual<
+    typeof import("@/lib/idempotency-disposition")
+  >("@/lib/idempotency-disposition");
+
+  return {
+    beginIdempotentFromRequest: vi.fn().mockResolvedValue({ kind: "proceed" }),
+    dispositionForExecutionOutcome,
+    idempotencyEarlyResponse: vi.fn().mockReturnValue(null),
+    recordIdempotentResponse: (
+      outcome: unknown,
+      response: Response,
+      disposition?: string
+    ) => recordIdempotentResponseMock(outcome, response, disposition),
+    withIdempotencyHeartbeat: (_outcome: unknown, fn: () => unknown) => fn(),
+  };
+});
 
 function protocolWithSupplyInputs(
   inputs: Array<{
@@ -151,7 +158,8 @@ describe("buildProtocolFunctionArgs", () => {
       { asset: "0xToken" },
       "test-protocol",
       "pool",
-      "supply"
+      "supply",
+      "1"
     );
 
     expect(result).toEqual({
@@ -177,7 +185,8 @@ describe("buildProtocolFunctionArgs", () => {
       { asset: "0xToken", amount: "1000" },
       "test-protocol",
       "pool",
-      "supply"
+      "supply",
+      "1"
     );
 
     expect(result).toEqual({
@@ -208,7 +217,8 @@ describe("buildProtocolFunctionArgs", () => {
       },
       "test-protocol",
       "pool",
-      "supply"
+      "supply",
+      "1"
     );
 
     expect(result).toEqual({
@@ -233,7 +243,8 @@ describe("buildProtocolFunctionArgs", () => {
       { asset: "0xToken", amount: null },
       "test-protocol",
       "pool",
-      "supply"
+      "supply",
+      "1"
     );
 
     expect(result).toEqual({
@@ -258,7 +269,8 @@ describe("buildProtocolFunctionArgs", () => {
       { asset: "0xToken" },
       "test-protocol",
       "pool",
-      "supply"
+      "supply",
+      "1"
     );
 
     expect(result).toEqual({
@@ -283,13 +295,60 @@ describe("buildProtocolFunctionArgs", () => {
       { asset: "0xToken" },
       "test-protocol",
       "pool",
-      "supply"
+      "supply",
+      "1"
     );
 
     expect(result).toEqual({
       ok: true,
       functionArgs: JSON.stringify(["0xToken", ""]),
     });
+  });
+
+  // The fake protocol above proves the mechanism; these two run the real
+  // Uniswap definition through it, so the slippage and deadline fields added
+  // for the position lifecycle cannot quietly gain a default later.
+  it("rejects blank slippage and deadline on the real uniswap actions", async () => {
+    const { default: uniswapDef } = await import("@/protocols/uniswap-v3");
+    getProtocolMock.mockReturnValue(uniswapDef);
+    const { buildProtocolFunctionArgs } = await import(
+      "../../app/api/execute/_lib/protocol-function-args"
+    );
+
+    const decrease = buildProtocolFunctionArgs(
+      {
+        tokenId: "1",
+        liquidity: "1000",
+        amount1Min: "0",
+        deadline: "4102444800",
+      },
+      "uniswap",
+      "positionManager",
+      "decreaseLiquidity",
+      "1"
+    );
+    expect(decrease.ok).toBe(false);
+    if (!decrease.ok) {
+      expect(decrease.field).toBe("amount0Min");
+    }
+
+    const increase = buildProtocolFunctionArgs(
+      {
+        tokenId: "1",
+        amount0Desired: "1",
+        amount1Desired: "1",
+        amount0Min: "0",
+        amount1Min: "0",
+      },
+      "uniswap",
+      "positionManager",
+      "increaseLiquidity",
+      "1"
+    );
+    expect(increase.ok).toBe(false);
+    if (!increase.ok) {
+      expect(increase.field).toBe("deadline");
+    }
   });
 
   it("returns undefined functionArgs when the action has no inputs", async () => {
@@ -305,7 +364,8 @@ describe("buildProtocolFunctionArgs", () => {
       {},
       "test-protocol",
       "pool",
-      "supply"
+      "supply",
+      "1"
     );
 
     expect(result).toEqual({ ok: true, functionArgs: undefined });
@@ -323,12 +383,111 @@ describe("buildProtocolFunctionArgs", () => {
       { path: ["0xA", "0xB"] },
       "test-protocol",
       "pool",
-      "supply"
+      "supply",
+      "1"
     );
 
     expect(result).toEqual({
       ok: true,
       functionArgs: JSON.stringify([JSON.stringify(["0xA", "0xB"])]),
+    });
+  });
+
+  // Direct execution is the third consumer of a protocol array input. Sending
+  // the elements as one string leaves ethers with text where it expects an
+  // array, so every array action is unusable through this route and MCP.
+  it("keeps the elements of an array input", async () => {
+    getProtocolMock.mockReturnValue(
+      protocolWithSupplyInputs([
+        { name: "requestIds", type: "uint256[]" },
+        { name: "hints", type: "uint256[]" },
+      ])
+    );
+
+    const { buildProtocolFunctionArgs } = await import(
+      "@/app/api/execute/_lib/protocol-function-args"
+    );
+    const result = buildProtocolFunctionArgs(
+      { requestIds: ["135184"], hints: ["1216"] },
+      "test-protocol",
+      "pool",
+      "supply",
+      "1"
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      functionArgs: JSON.stringify([["135184"], ["1216"]]),
+    });
+  });
+
+  it("reads a JSON array string for an array input as an array", async () => {
+    getProtocolMock.mockReturnValue(
+      protocolWithSupplyInputs([{ name: "requestIds", type: "uint256[]" }])
+    );
+
+    const { buildProtocolFunctionArgs } = await import(
+      "@/app/api/execute/_lib/protocol-function-args"
+    );
+    const result = buildProtocolFunctionArgs(
+      { requestIds: '["135184","135185"]' },
+      "test-protocol",
+      "pool",
+      "supply",
+      "1"
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      functionArgs: JSON.stringify([["135184", "135185"]]),
+    });
+  });
+
+  it("reads a legacy scalar for an array input as a one-item array", async () => {
+    getProtocolMock.mockReturnValue(
+      protocolWithSupplyInputs([{ name: "gauges", type: "address[]" }])
+    );
+
+    const { buildProtocolFunctionArgs } = await import(
+      "@/app/api/execute/_lib/protocol-function-args"
+    );
+    const result = buildProtocolFunctionArgs(
+      { gauges: "0x1F98431c8aD98523631AE4a59f267346ea31F984" },
+      "test-protocol",
+      "pool",
+      "supply",
+      "1"
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      functionArgs: JSON.stringify([
+        ["0x1F98431c8aD98523631AE4a59f267346ea31F984"],
+      ]),
+    });
+  });
+
+  it("normalizes an array default for a blank optional input", async () => {
+    getProtocolMock.mockReturnValue(
+      protocolWithSupplyInputs([
+        { name: "requestIds", type: "uint256[]", default: '["12","34"]' },
+      ])
+    );
+
+    const { buildProtocolFunctionArgs } = await import(
+      "@/app/api/execute/_lib/protocol-function-args"
+    );
+    const result = buildProtocolFunctionArgs(
+      {},
+      "test-protocol",
+      "pool",
+      "supply",
+      "1"
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      functionArgs: JSON.stringify([["12", "34"]]),
     });
   });
 });

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ---------------------------------------------------------------------------
 // Hoisted mocks -- available to vi.mock factories which run before any imports
@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => ({
   stepFn: vi.fn(),
   ownershipResult: [] as unknown[],
   capturedInput: undefined as Record<string, unknown> | undefined,
+  recordIdempotentResponse: vi.fn(),
 }));
 
 vi.mock("server-only", () => ({}));
@@ -74,6 +75,14 @@ vi.mock("@/app/api/execute/_lib/execution-service", async (importActual) => {
 vi.mock("@/app/api/execute/_lib/action-resolver", () => ({
   resolveAction: mocks.resolveAction,
 }));
+
+vi.mock("@/lib/idempotency", async (importActual) => {
+  const actual = await importActual<typeof import("@/lib/idempotency")>();
+  return {
+    ...actual,
+    recordIdempotentResponse: mocks.recordIdempotentResponse,
+  };
+});
 
 vi.mock("@/lib/utils", async () => {
   const actual =
@@ -144,6 +153,9 @@ beforeEach(() => {
   mocks.redactInput.mockImplementation(
     (input: Record<string, unknown>) => input
   );
+  mocks.recordIdempotentResponse.mockImplementation(
+    (_outcome: unknown, response: Response) => Promise.resolve(response)
+  );
 
   mocks.stepFn.mockImplementation((input: Record<string, unknown>) => {
     mocks.capturedInput = input;
@@ -161,9 +173,334 @@ beforeEach(() => {
   }));
 });
 
+afterEach(() => {
+  // A step's declared ceiling is written onto the shared step mock as an own
+  // property, and vi.clearAllMocks() clears call history rather than removing
+  // properties. Without this, the first case that declares one leaves it on the
+  // mock for every test after it in this file - which is why the cases below
+  // only passed in the order they are written in.
+  delete (mocks.stepFn as { maxRetries?: number | string }).maxRetries;
+});
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// The node route reserves a step's native value BEFORE the step runs and
+// then tells the step not to reserve again (valueCapReserved). For a
+// protocol write whose value field registers a transform - the LayerZero OFT
+// send takes wei - the reservation has to run that transform, or the cap is
+// charged the raw wei figure read as ether (10^18 times the broadcast) while
+// the step's correct charge is skipped.
+describe("POST /api/execute/node value reservation for a protocol write", () => {
+  const WALLET = "0x1111111111111111111111111111111111111111";
+  const FEE_WEI = "218756042576226";
+
+  function protocolWrite() {
+    mocks.resolveAction.mockImplementation((actionType: string) => ({
+      actionType,
+      label: "Protocol Write",
+      importer: {
+        importer: () => Promise.resolve({ protocolWriteStep: mocks.stepFn }),
+        stepFunction: "protocolWriteStep",
+      },
+      isPluginAction: true,
+    }));
+  }
+
+  function sendConfig(nativeFee: unknown): Record<string, unknown> {
+    return {
+      network: "1",
+      _actionType: "layerzero/oft-send",
+      contractAddress: "0x6C96dE32CEa08842dcc4058c14d3aaAD7Fa41dee",
+      dstEid: "30110",
+      to: WALLET,
+      amountLD: "1000000",
+      minAmountLD: "990000",
+      nativeFee,
+      lzTokenFee: "0",
+    };
+  }
+
+  it("reserves by the request's action, not an action the config names", async () => {
+    protocolWrite();
+
+    const response = await nodePOST(
+      postRequest({
+        actionType: "wrapped/wrap",
+        config: {
+          network: "1",
+          _actionType: "layerzero/oft-send",
+          ethValue: "1",
+        },
+      })
+    );
+
+    expect(response.status).toBe(200);
+    // wrapped/wrap takes ether: "1" is 1 ETH, and the reservation must say so.
+    expect(mocks.checkAndReserveExecution).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reserved: { kind: "evm", valueWei: "1000000000000000000" },
+      })
+    );
+  });
+
+  it("converts by the request's action even when the config names an ether action", async () => {
+    protocolWrite();
+    const { _actionType: _omitted, ...rest } = sendConfig(FEE_WEI);
+
+    const response = await nodePOST(
+      postRequest({
+        actionType: "layerzero/oft-send",
+        config: { ...rest, _actionType: "wrapped/wrap" },
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.checkAndReserveExecution).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reserved: { kind: "evm", valueWei: FEE_WEI },
+      })
+    );
+  });
+
+  it("reserves exactly the wei an OFT Send's nativeFee holds", async () => {
+    protocolWrite();
+
+    const response = await nodePOST(
+      postRequest({
+        actionType: "layerzero/oft-send",
+        config: sendConfig(FEE_WEI),
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.checkAndReserveExecution).toHaveBeenCalledTimes(1);
+    expect(mocks.checkAndReserveExecution).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reserved: { kind: "evm", valueWei: FEE_WEI },
+      })
+    );
+    // The step receives the raw wei string in nativeFee and converts it
+    // itself, exactly as it does on the workflow path; what changed is only
+    // what the route reserved. And it is still told not to reserve a second
+    // time. There is no separate value field any more.
+    expect(mocks.capturedInput?.nativeFee).toBe(FEE_WEI);
+    expect(mocks.capturedInput?.ethValue).toBeUndefined();
+    expect(
+      (mocks.capturedInput as { _context: { valueCapReserved: boolean } })
+        ._context.valueCapReserved
+    ).toBe(true);
+  });
+
+  it("reserves 0.0001 ETH for a 1e14-wei nativeFee and hands the step the raw wei", async () => {
+    protocolWrite();
+
+    const response = await nodePOST(
+      postRequest({
+        actionType: "layerzero/oft-send",
+        config: sendConfig("100000000000000"),
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.checkAndReserveExecution).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reserved: { kind: "evm", valueWei: "100000000000000" },
+      })
+    );
+    expect(mocks.capturedInput?.nativeFee).toBe("100000000000000");
+    expect(mocks.capturedInput?.ethValue).toBeUndefined();
+  });
+
+  it("ignores a caller's _protocolMeta and resolves from the request's action", async () => {
+    protocolWrite();
+    const { _actionType: _omitted, ...config } = sendConfig(FEE_WEI);
+
+    const response = await nodePOST(
+      postRequest({
+        actionType: "layerzero/oft-send",
+        config: {
+          ...config,
+          // An ether-typed action's metadata: if the route read this key it
+          // would parse FEE_WEI as ether and reserve ~2.19e32 wei.
+          _protocolMeta: JSON.stringify({
+            protocolSlug: "wrapped",
+            contractKey: "weth",
+            functionName: "deposit",
+            actionType: "write",
+          }),
+        },
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.checkAndReserveExecution).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reserved: { kind: "evm", valueWei: FEE_WEI },
+      })
+    );
+  });
+
+  it("reserves the converted value when the config carries no metadata, because the step resolves from the request", async () => {
+    // executeNode strips _actionType and _protocolMeta from the config and
+    // hands the step the request's resolved action, so a config carrying no
+    // metadata still resolves - the reservation resolves the same way.
+    protocolWrite();
+    const { _actionType: _omitted, ...config } = sendConfig(FEE_WEI);
+
+    const response = await nodePOST(
+      postRequest({ actionType: "layerzero/oft-send", config })
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.checkAndReserveExecution).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reserved: { kind: "evm", valueWei: FEE_WEI },
+      })
+    );
+  });
+
+  it("reserves zero for a numeric value on an unresolvable action, exactly as before", async () => {
+    // Prior behaviour for a non-string value: parseNodeNativeValueWei only
+    // reads a string ethValue, so a number reserved 0 and the step dropped
+    // it. A stale action must not turn that into a refusal.
+    protocolWrite();
+
+    const response = await nodePOST(
+      postRequest({
+        actionType: "layerzero/no-such-action",
+        config: {
+          ...sendConfig(218_756_042_576_226),
+          _actionType: "layerzero/no-such-action",
+        },
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.checkAndReserveExecution).toHaveBeenCalledWith(
+      expect.objectContaining({ reserved: { kind: "evm", valueWei: "0" } })
+    );
+    expect(mocks.capturedInput?.nativeFee).toBe(218_756_042_576_226);
+  });
+
+  it("refuses to reserve a value for a protocol write it cannot resolve", async () => {
+    protocolWrite();
+
+    const response = await nodePOST(
+      postRequest({
+        actionType: "layerzero/no-such-action",
+        config: {
+          ...sendConfig(FEE_WEI),
+          // The action cannot be resolved, so nothing declares a value
+          // source; the non-empty string ethValue is the value refused on.
+          ethValue: FEE_WEI,
+          _actionType: "layerzero/no-such-action",
+        },
+      })
+    );
+
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toMatch(/Refusing to reserve/);
+    expect(mocks.checkAndReserveExecution).not.toHaveBeenCalled();
+    expect(mocks.stepFn).not.toHaveBeenCalled();
+  });
+
+  it("refuses a drifted action whose value sits on its declared input", async () => {
+    // The caller sent nativeFee, not ethValue. Reading only ethValue would
+    // report this call as carrying no value and reserve zero for it.
+    protocolWrite();
+
+    const response = await nodePOST(
+      postRequest({
+        actionType: "layerzero/no-such-action",
+        config: {
+          ...sendConfig(FEE_WEI),
+          _actionType: "layerzero/no-such-action",
+        },
+      })
+    );
+
+    expect(response.status).toBe(400);
+    const { error } = await response.json();
+    expect(error).toMatch(/Refusing to reserve/);
+    expect(error).not.toMatch(/ethValue/);
+    expect(mocks.checkAndReserveExecution).not.toHaveBeenCalled();
+    expect(mocks.stepFn).not.toHaveBeenCalled();
+  });
+
+  it("refuses the reservation when a separate ethValue disagrees with nativeFee", async () => {
+    protocolWrite();
+
+    const response = await nodePOST(
+      postRequest({
+        actionType: "layerzero/oft-send",
+        config: { ...sendConfig(FEE_WEI), ethValue: "1" },
+      })
+    );
+
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toMatch(
+      /takes its value from "nativeFee"/
+    );
+    expect(mocks.checkAndReserveExecution).not.toHaveBeenCalled();
+    expect(mocks.stepFn).not.toHaveBeenCalled();
+  });
+
+  it("refuses ether typed into the wei field as the caller's error", async () => {
+    protocolWrite();
+
+    const response = await nodePOST(
+      postRequest({
+        actionType: "layerzero/oft-send",
+        config: sendConfig("0.01"),
+      })
+    );
+
+    expect(response.status).toBe(400);
+    const data = await response.json();
+    // The error names nativeFee, the field the caller typed the ether in.
+    expect(data.error).toMatch(/Invalid nativeFee/);
+    expect(data.error).toMatch(/integer wei/);
+    expect(mocks.checkAndReserveExecution).not.toHaveBeenCalled();
+    expect(mocks.stepFn).not.toHaveBeenCalled();
+  });
+
+  it("still reserves an ether value field as ether on a protocol write with no transform", async () => {
+    protocolWrite();
+
+    const response = await nodePOST(
+      postRequest({
+        actionType: "wrapped/wrap",
+        config: { network: "1", _actionType: "wrapped/wrap", ethValue: "0.01" },
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.checkAndReserveExecution).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reserved: { kind: "evm", valueWei: "10000000000000000" },
+      })
+    );
+    expect(mocks.capturedInput?.ethValue).toBe("0.01");
+  });
+
+  it("leaves a generic contract write's ether value exactly as before", async () => {
+    const response = await nodePOST(
+      postRequest({
+        actionType: "web3/write-contract",
+        config: { network: "1", contractAddress: "0xabc", ethValue: "0.1" },
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.checkAndReserveExecution).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reserved: { kind: "evm", valueWei: "100000000000000000" },
+      })
+    );
+  });
+});
 
 describe("POST /api/execute/node reserved-field gating", () => {
   it("rejects a foreign integrationId smuggled inside config with 403", async () => {
@@ -285,6 +622,40 @@ describe("POST /api/execute/node reserved-field gating", () => {
     expect(auditInput._rejectedConfig).toEqual({ web3Connection: "eoa" });
   });
 
+  it("keeps a smuggled _actionType and _protocolMeta out of the audit input's top level", async () => {
+    const response = await nodePOST(
+      postRequest({
+        actionType: "web3/write-contract",
+        config: {
+          network: "1",
+          contractAddress: "0xabc",
+          // Both are route-owned: the route injects _actionType from the
+          // resolved action, and _protocolMeta is a builder-persisted snapshot
+          // of the same thing that a derivable _actionType always beats.
+          _actionType: "sky/vault-deposit",
+          _protocolMeta: '{"protocolSlug":"sky","contractKey":"sUsds"}',
+        },
+      })
+    );
+
+    expect(response.status).toBe(200);
+    // Neither may sit beside contractAddress, which did take effect.
+    const auditInput = mocks.checkAndReserveExecution.mock.calls[0]?.[0]
+      ?.input as Record<string, unknown>;
+    expect(auditInput).toBeDefined();
+    expect("_actionType" in auditInput).toBe(false);
+    expect("_protocolMeta" in auditInput).toBe(false);
+    expect(auditInput.contractAddress).toBe("0xabc");
+    expect(auditInput._rejectedConfig).toEqual({
+      _actionType: "sky/vault-deposit",
+      _protocolMeta: '{"protocolSlug":"sky","contractKey":"sUsds"}',
+    });
+    // The step sees the route's action type and no stale snapshot at all.
+    expect(mocks.capturedInput?._actionType).toBe("web3/write-contract");
+    expect("_protocolMeta" in (mocks.capturedInput ?? {})).toBe(false);
+    expect("_rejectedConfig" in (mocks.capturedInput ?? {})).toBe(false);
+  });
+
   it("omits _rejectedConfig from the audit input when no override was sent", async () => {
     const response = await nodePOST(
       postRequest({
@@ -340,6 +711,265 @@ describe("POST /api/execute/node reserved-field gating", () => {
 
     expect([200, 202]).toContain(response.status);
   });
+
+  it("budgets an absent maxRetries at the default the executor will apply", async () => {
+    // The validator used to default a missing count to 0, so this was checked
+    // as one attempt of 600000ms - inside the budget - and then run by
+    // resolveConfig as four, up to 2_400_000ms: four times the idempotency
+    // processing lock this budget exists to stay inside.
+    //
+    // A run that long does not lose its lock on its own. withIdempotencyHeartbeat
+    // re-stamps expiresAt every couple of minutes and the reclaim is fenced on
+    // an expired row, so the lock only lapses if the heartbeat also fails - and
+    // it is fire-and-forget with an empty catch. The budget is the invariant
+    // that keeps a request inside its own reservation without depending on
+    // that; this pins the arithmetic, not the failure mode.
+    const response = await nodePOST(
+      postRequest({
+        actionType: "web3/write-contract",
+        config: { network: "1", contractAddress: "0xabc" },
+        retry: { timeoutMs: 600_000 },
+      })
+    );
+
+    expect(response.status).toBe(400);
+    expect(mocks.checkAndReserveExecution).not.toHaveBeenCalled();
+    expect(mocks.stepFn).not.toHaveBeenCalled();
+  });
+
+  it("names the effective attempt count and the safe remedy in the rejection", async () => {
+    // Without the attempt count the arithmetic reads as self-contradicting to
+    // a caller who sent no maxRetries: they compute 600000 x (0 + 1), which is
+    // not over the limit.
+    //
+    // Naming maxRetries: 0 is the safety-relevant half. The apparent remedy is
+    // to lower timeoutMs, and a timeoutMs under the chain's confirmation
+    // latency is what turns one slow write into several: withTimeout races a
+    // setTimeout rather than cancelling, so an abandoned attempt can still
+    // broadcast while the next one signs at the next nonce.
+    const response = await nodePOST(
+      postRequest({
+        actionType: "web3/write-contract",
+        config: { network: "1", contractAddress: "0xabc" },
+        retry: { timeoutMs: 600_000 },
+      })
+    );
+
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error?: string };
+    expect(body.error).toContain("4 attempts");
+    expect(body.error).toContain("maxRetries defaults to 3");
+    expect(body.error).toContain("2400000ms");
+    expect(body.error).toContain("maxRetries: 0");
+  });
+
+  it("omits the defaulting note when the caller set maxRetries itself", async () => {
+    const response = await nodePOST(
+      postRequest({
+        actionType: "web3/write-contract",
+        config: { network: "1", contractAddress: "0xabc" },
+        retry: { maxRetries: 10, timeoutMs: 600_000 },
+      })
+    );
+
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error?: string };
+    expect(body.error).toContain("11 attempts");
+    expect(body.error).not.toContain("defaults to");
+  });
+
+  it("still accepts an absent maxRetries whose defaulted budget fits", async () => {
+    // The counterpart to the case above: defaulting to DEFAULT_MAX_RETRIES
+    // must not reject everything that omits the field. 4 x 120000 = 480000,
+    // inside the 600000ms lock TTL.
+    const response = await nodePOST(
+      postRequest({
+        actionType: "web3/write-contract",
+        config: { network: "1", contractAddress: "0xabc" },
+        retry: { timeoutMs: 120_000 },
+      })
+    );
+
+    expect([200, 202]).toContain(response.status);
+  });
+
+  it("budgets an explicit maxRetries of 0 as the single attempt it is", async () => {
+    // Defaulting must not become clamping: 0 is a meaningful value that
+    // resolveConfig honours via ??, so one attempt of 600000ms is exactly the
+    // budget and stays admissible.
+    const response = await nodePOST(
+      postRequest({
+        actionType: "web3/write-contract",
+        config: { network: "1", contractAddress: "0xabc" },
+        retry: { maxRetries: 0, timeoutMs: 600_000 },
+      })
+    );
+
+    expect([200, 202]).toContain(response.status);
+  });
+
+  it("accepts an empty retry object at both of the executor's defaults", async () => {
+    // The only request shape where maxRetries and timeoutMs are both
+    // defaulted, and the pair only became load-bearing here: 4 x 120000 =
+    // 480000 now fills most of the 600000ms lock where the single-attempt
+    // reading left it at 120000. Every other case above pins timeoutMs
+    // explicitly, so raising DEFAULT_TIMEOUT_MS past 150000 would start
+    // rejecting every caller that sends `retry: {}` with nothing to catch it.
+    const response = await nodePOST(
+      postRequest({
+        actionType: "web3/write-contract",
+        config: { network: "1", contractAddress: "0xabc" },
+        retry: {},
+      })
+    );
+
+    expect([200, 202]).toContain(response.status);
+  });
+});
+
+describe("POST /api/execute/node step-declared retry ceiling", () => {
+  // The wiring is the defect: invokeStep reads the property off an object that
+  // arrives through a dynamic import. A helper test cannot see that line, so
+  // reverting the route to `if (retry)` would leave every unit case green.
+  it("runs a step that declares maxRetries = 0 exactly once", async () => {
+    Object.assign(mocks.stepFn, { maxRetries: 0 });
+    mocks.stepFn.mockResolvedValue({
+      success: false,
+      error: "read ECONNRESET",
+    });
+
+    await nodePOST(
+      postRequest({
+        actionType: "web3/write-contract",
+        config: { network: "1", contractAddress: "0xabc" },
+        retry: { maxRetries: 3, timeoutMs: 120_000 },
+      })
+    );
+
+    // "read ECONNRESET" is in RETRYABLE_PATTERNS and the failure carries no
+    // hash, so without the declaration this is four calls.
+    expect(mocks.stepFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("still retries a step that declares nothing, four calls for three retries", async () => {
+    mocks.stepFn.mockResolvedValue({
+      success: false,
+      error: "read ECONNRESET",
+    });
+
+    await nodePOST(
+      postRequest({
+        actionType: "web3/write-contract",
+        config: { network: "1", contractAddress: "0xabc" },
+        retry: { maxRetries: 3, timeoutMs: 120_000 },
+      })
+    );
+
+    expect(mocks.stepFn).toHaveBeenCalledTimes(4);
+  });
+
+  it("reports the budget the declaration left in force", async () => {
+    // The round-7 finding: a caller asking for three retries against a step that
+    // declares none got a 200, one attempt and no retryCount, which is the same
+    // shape as never having asked. Every value-moving step reachable through
+    // `resolveAction` declares 0, and the ones declaring nothing are read-only
+    // queries, so this is the common case rather than the corner.
+    Object.assign(mocks.stepFn, { maxRetries: 0 });
+    mocks.stepFn.mockResolvedValue({
+      success: false,
+      error: "read ECONNRESET",
+    });
+
+    const response = await nodePOST(
+      postRequest({
+        actionType: "web3/write-contract",
+        config: { network: "1", contractAddress: "0xabc" },
+        retry: { maxRetries: 3, timeoutMs: 120_000 },
+      })
+    );
+    const body = (await response.json()) as Record<string, unknown>;
+
+    expect(mocks.stepFn).toHaveBeenCalledTimes(1);
+    expect(body.maxRetriesApplied).toBe(0);
+    // Nothing was retried, so the count is still omitted rather than reported.
+    expect(body.retryCount).toBeUndefined();
+  });
+
+  it("reports the caller's own budget when the declaration is absent", async () => {
+    mocks.stepFn.mockResolvedValue({
+      success: false,
+      error: "read ECONNRESET",
+    });
+
+    const response = await nodePOST(
+      postRequest({
+        actionType: "web3/write-contract",
+        config: { network: "1", contractAddress: "0xabc" },
+        retry: { maxRetries: 3, timeoutMs: 120_000 },
+      })
+    );
+    const body = (await response.json()) as Record<string, unknown>;
+
+    expect(mocks.stepFn).toHaveBeenCalledTimes(4);
+    expect(body.maxRetriesApplied).toBe(3);
+  });
+
+  it("reports no budget when the caller never asked to retry", async () => {
+    // Absent rather than 0, so the field distinguishes "never asked" from
+    // "asked and was overridden" instead of collapsing the two.
+    mocks.stepFn.mockResolvedValue({ success: true });
+
+    const response = await nodePOST(
+      postRequest({
+        actionType: "web3/write-contract",
+        config: { network: "1", contractAddress: "0xabc" },
+      })
+    );
+    const body = (await response.json()) as Record<string, unknown>;
+
+    expect(response.status).toBe(200);
+    expect(body.maxRetriesApplied).toBeUndefined();
+  });
+
+  it("reports no budget for a declaring step the caller never retried", async () => {
+    // The field is the budget in force for this request, not the step's ceiling:
+    // a step declaring 0 against a request that sent no `retry` runs once and
+    // reports nothing, because no budget was applied to that request. Reading the
+    // field as "this step allows N" is wrong exactly here, and this is the case
+    // that pins the difference - the run above carries no declaration.
+    Object.assign(mocks.stepFn, { maxRetries: 0 });
+    mocks.stepFn.mockResolvedValue({ success: true });
+
+    const response = await nodePOST(
+      postRequest({
+        actionType: "web3/write-contract",
+        config: { network: "1", contractAddress: "0xabc" },
+      })
+    );
+    const body = (await response.json()) as Record<string, unknown>;
+
+    expect(response.status).toBe(200);
+    expect(mocks.stepFn).toHaveBeenCalledTimes(1);
+    expect(body.maxRetriesApplied).toBeUndefined();
+  });
+
+  it("honours a declaration that is a string zero, which the import cannot type-check", async () => {
+    Object.assign(mocks.stepFn, { maxRetries: "0" });
+    mocks.stepFn.mockResolvedValue({
+      success: false,
+      error: "read ECONNRESET",
+    });
+
+    await nodePOST(
+      postRequest({
+        actionType: "web3/write-contract",
+        config: { network: "1", contractAddress: "0xabc" },
+        retry: { maxRetries: 3, timeoutMs: 120_000 },
+      })
+    );
+
+    expect(mocks.stepFn).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("POST /api/execute/node broadcast hash on a failed step", () => {
@@ -353,6 +983,7 @@ describe("POST /api/execute/node broadcast hash on a failed step", () => {
       error: "Transaction sent but receipt not available",
       transactionHash: "0xpending",
       chainId: 1,
+      broadcastAttempted: true,
     });
     mocks.failExecution.mockResolvedValue({ status: "unconfirmed" });
 
@@ -366,7 +997,11 @@ describe("POST /api/execute/node broadcast hash on a failed step", () => {
     expect(mocks.failExecution).toHaveBeenCalledWith(
       "ex1",
       "Transaction sent but receipt not available",
-      expect.objectContaining({ transactionHash: "0xpending", chainId: 1 })
+      expect.objectContaining({
+        transactionHash: "0xpending",
+        chainId: 1,
+        broadcastAttempted: true,
+      })
     );
     const body = (await response.json()) as Record<string, unknown>;
     expect(body.status).toBe("unconfirmed");
@@ -375,6 +1010,65 @@ describe("POST /api/execute/node broadcast hash on a failed step", () => {
     // transport layer, same as its verified-success branch; only the body
     // distinguishes them.
     expect(response.status).toBe(422);
+  });
+
+  it("forwards the request's action type to the step as _actionType", async () => {
+    // The protocol steps only apply the chain-scoped L2 slug aliases on the
+    // _actionType branch of resolveProtocolMeta. Without this field a node
+    // executed here resolves from whatever _protocolMeta the caller carried,
+    // so an old slug on an L2 fails while the same node succeeds through the
+    // workflow executor.
+    const response = await nodePOST(
+      postRequest({
+        actionType: "sky/vault-balance",
+        network: "8453",
+        config: { account: "0xabc" },
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.capturedInput?._actionType).toBe("sky/vault-balance");
+  });
+
+  it("forwards the canonical action type when the request named the action by label", async () => {
+    // resolveAction accepts a legacy id or an exact label and hands back the
+    // canonical `<protocol>/<slug>` id. The raw request string derives nothing
+    // in resolveProtocolMeta, so forwarding it would run the right step and
+    // then leave it resolving from whatever _protocolMeta the caller carried -
+    // the hole the _actionType forward exists to close.
+    mocks.resolveAction.mockImplementation(() => ({
+      actionType: "sky/vault-balance",
+      label: "Sky: Vault Share Balance",
+      importer: {
+        importer: () => Promise.resolve({ step: mocks.stepFn }),
+        stepFunction: "step",
+      },
+      isPluginAction: true,
+    }));
+
+    const response = await nodePOST(
+      postRequest({
+        actionType: "Sky: Vault Share Balance",
+        network: "8453",
+        config: { account: "0xabc" },
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.capturedInput?._actionType).toBe("sky/vault-balance");
+  });
+
+  it("overrides an _actionType smuggled inside config", async () => {
+    const response = await nodePOST(
+      postRequest({
+        actionType: "sky/vault-balance",
+        network: "8453",
+        config: { account: "0xabc", _actionType: "sky/vault-deposit" },
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.capturedInput?._actionType).toBe("sky/vault-balance");
   });
 
   it("still reports a pre-broadcast failure as terminal with no hash", async () => {
@@ -394,5 +1088,117 @@ describe("POST /api/execute/node broadcast hash on a failed step", () => {
     const body = (await response.json()) as Record<string, unknown>;
     expect(body.status).toBe("failed");
     expect(body.transactionHash).toBeUndefined();
+  });
+
+  it("releases a failed node transaction only after hash+chain adjudication", async () => {
+    mocks.stepFn.mockResolvedValue({
+      success: false,
+      error: "execution reverted",
+      transactionHash: "0xreverted",
+      chainId: 8453,
+    });
+    mocks.failExecution.mockResolvedValue({ status: "failed" });
+
+    await nodePOST(
+      postRequest({
+        actionType: "web3/write-contract",
+        config: { network: "8453", contractAddress: "0xabc" },
+      })
+    );
+
+    expect(mocks.recordIdempotentResponse.mock.calls.at(-1)?.[2]).toBe(
+      "release"
+    );
+  });
+
+  it("holds a failed node transaction while receipt verification is unconfirmed", async () => {
+    mocks.stepFn.mockResolvedValue({
+      success: false,
+      error: "receipt unavailable",
+      transactionHash: "0xpending",
+      chainId: 8453,
+    });
+    mocks.failExecution.mockResolvedValue({ status: "unconfirmed" });
+
+    await nodePOST(
+      postRequest({
+        actionType: "web3/write-contract",
+        config: { network: "8453", contractAddress: "0xabc" },
+      })
+    );
+
+    expect(mocks.recordIdempotentResponse.mock.calls.at(-1)?.[2]).toBe(
+      "failed"
+    );
+  });
+
+  it("holds a hash when chainId is not numeric instead of releasing it", async () => {
+    mocks.stepFn.mockResolvedValue({
+      success: false,
+      error: "provider returned malformed chain context",
+      transactionHash: "0xlive",
+      chainId: "8453",
+    });
+    mocks.failExecution.mockResolvedValue({ status: "failed" });
+
+    await nodePOST(
+      postRequest({
+        actionType: "web3/write-contract",
+        config: { network: "8453", contractAddress: "0xabc" },
+      })
+    );
+
+    expect(mocks.failExecution).toHaveBeenCalledWith(
+      "ex1",
+      "provider returned malformed chain context",
+      expect.objectContaining({ transactionHash: "0xlive", chainId: undefined })
+    );
+    expect(mocks.recordIdempotentResponse.mock.calls.at(-1)?.[2]).toBe(
+      "failed"
+    );
+  });
+
+  it("releases the non-completed success branch only after hash+chain adjudication", async () => {
+    mocks.stepFn.mockResolvedValue({
+      success: true,
+      transactionHash: "0xreverted",
+      gasUsed: "21000",
+      effectiveGasPrice: "1",
+      chainId: 8453,
+    });
+    mocks.completeExecution.mockResolvedValue({ status: "failed" });
+
+    await nodePOST(
+      postRequest({
+        actionType: "web3/write-contract",
+        config: { network: "8453", contractAddress: "0xabc" },
+      })
+    );
+
+    expect(mocks.recordIdempotentResponse.mock.calls.at(-1)?.[2]).toBe(
+      "release"
+    );
+  });
+
+  it("holds the non-completed success branch while verification is unconfirmed", async () => {
+    mocks.stepFn.mockResolvedValue({
+      success: true,
+      transactionHash: "0xpending",
+      gasUsed: "21000",
+      effectiveGasPrice: "1",
+      chainId: 8453,
+    });
+    mocks.completeExecution.mockResolvedValue({ status: "unconfirmed" });
+
+    await nodePOST(
+      postRequest({
+        actionType: "web3/write-contract",
+        config: { network: "8453", contractAddress: "0xabc" },
+      })
+    );
+
+    expect(mocks.recordIdempotentResponse.mock.calls.at(-1)?.[2]).toBe(
+      "failed"
+    );
   });
 });

@@ -1,10 +1,14 @@
+import { aliasedChainIds } from "@/lib/protocol-action-aliases";
 import {
   assertEncodeTransformsLegalFor,
+  getEncodeTransformKind,
   setActionInputsLookup,
 } from "@/lib/protocol-encode-transforms";
 import { solidityTypeToFieldType } from "@/lib/solidity-type-fields";
 import type { IntegrationType } from "@/lib/types/integration";
+import { getReadContractOutputFields } from "@/lib/workflow/editor/action-output-fields";
 
+import { sponsorGasField } from "@/plugins/field-fragments";
 import {
   createProtocolIconComponent,
   ProtocolIcon,
@@ -17,7 +21,6 @@ import type {
 } from "@/plugins/registry";
 
 const KEBAB_CASE_REGEX = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
-const HEX_ADDRESS_REGEX = /^0x[0-9a-fA-F]{40}$/;
 
 export type ProtocolContract = {
   label: string;
@@ -43,6 +46,8 @@ export type ProtocolActionInput = {
   helpTip?: string;
   docUrl?: string;
   components?: ProtocolActionInputComponent[];
+  /** The input is not a user field. writeContractCore sets this top-level address argument to the address that pays for the call (the Safe in safe modes, the org wallet otherwise). */
+  payer?: boolean;
 };
 
 export type ProtocolActionOutput = {
@@ -84,6 +89,21 @@ export type ProtocolAction = {
    *  fed to the gas-limit-multiplier field as defaultValue. Only set on
    *  write actions whose override declared a gasLimit; reads ignore it. */
   gasLimitDefault?: string;
+  /** Label and help text for the virtual payable value field, declared by
+   *  a payable action whose value is not typed in whole ether (an action
+   *  with a weiToEther transform on ethValue takes wei). Absent on every
+   *  action that declares nothing, which keeps its "ETH Value" field
+   *  exactly as before. See PayableValueOverride in lib/abi/protocol-derive.ts. */
+  payableValue?: PayableValueField;
+};
+
+export type PayableValueField = {
+  label?: string;
+  helpTip?: string;
+  docUrl?: string;
+  placeholder?: string;
+  /** Name of an action input whose value the transaction carries as msg.value. When set, no separate value field is rendered and every entrance reads the value from this input. */
+  fromInput?: string;
 };
 
 export type ProtocolDefinition = {
@@ -122,7 +142,7 @@ function validateAddresses(contracts: Record<string, ProtocolContract>): void {
       continue;
     }
     for (const [chain, address] of Object.entries(contract.addresses)) {
-      if (!HEX_ADDRESS_REGEX.test(address)) {
+      if (!EVM_ADDRESS_RE.test(address)) {
         throw new Error(
           `Invalid address "${address}" for contract "${contractKey}" on chain "${chain}": must be a 42-character hex string starting with 0x`
         );
@@ -202,6 +222,29 @@ export function defineProtocol(def: ProtocolDefinition): ProtocolDefinition {
 
   for (const action of def.actions) {
     validateSlug(action.slug, `action of protocol "${def.slug}"`);
+    // The ABI deriver refuses this too; the check is repeated here for a
+    // definition built by hand, which never passes through the deriver.
+    if (action.payableValue !== undefined && !action.payable) {
+      throw new Error(
+        `Action "${action.slug}" of protocol "${def.slug}" declares payableValue but is not payable, so no value field exists to label`
+      );
+    }
+    const fromInput = action.payableValue?.fromInput;
+    if (fromInput !== undefined) {
+      const target = action.inputs.find((input) => input.name === fromInput);
+      if (!(target && !target.payer)) {
+        throw new Error(
+          `payableValue.fromInput "${fromInput}" must name a user input of ${action.slug}`
+        );
+      }
+    }
+    for (const input of action.inputs) {
+      if (input.payer && input.type !== "address") {
+        throw new Error(
+          `payer input "${input.name}" must be an address parameter, got ${input.type}`
+        );
+      }
+    }
   }
 
   validateAddresses(def.contracts);
@@ -223,6 +266,7 @@ import {
   deriveActionsFromAbi,
   deriveEventsFromAbi,
 } from "@/lib/abi/protocol-derive";
+import { EVM_ADDRESS_RE } from "@/lib/web3/address";
 
 export type {
   AbiDrivenContract,
@@ -231,6 +275,7 @@ export type {
   AbiFunctionOverride,
   AbiInputOverride,
   AbiOutputOverride,
+  PayableValueOverride,
 } from "@/lib/abi/protocol-derive";
 
 export function defineAbiProtocol(
@@ -387,12 +432,72 @@ function buildInputField(input: ProtocolActionInput): ActionConfigFieldBase {
   };
 }
 
+// The payable value field every payable action gets. Kept as one small
+// function so the label hook can be swapped for a dedicated field type
+// without touching the field list around it. An action that declares no
+// payableValue and registers no value transform gets the field exactly as
+// it was before the hook existed: "ETH Value", protocol-eth-value,
+// placeholder "0.0", optional unless it is the action's only input, no help
+// text.
+//
+// An action that registers weiToEther on its value field takes an integer
+// wei string, not a decimal ether amount, so its field is validated as a
+// uint256 (integer digits or a template; "0.001" is refused where the
+// decimal field would accept it) and is required: a blank value on such an
+// action is not "send nothing", it is a fee of zero, which the contract
+// rejects after the transaction has been paid for. Keyed off the transform
+// registry rather than a separate flag so the validation cannot disagree
+// with the conversion that actually runs.
+function buildPayableValueField(
+  def: ProtocolDefinition,
+  action: ProtocolAction,
+  requiredByDefault: boolean
+): ActionConfigFieldBase {
+  const declared = action.payableValue;
+  const takesWei =
+    getEncodeTransformKind(def.slug, action.slug, "ethValue") === "weiToEther";
+  const tipFields = {
+    ...(declared?.helpTip ? { helpTip: declared.helpTip } : {}),
+    ...(declared?.docUrl ? { docUrl: declared.docUrl } : {}),
+  };
+  if (takesWei) {
+    return {
+      key: "ethValue",
+      label: declared?.label ?? "Value (wei)",
+      type: "protocol-uint",
+      solidityType: "uint256",
+      placeholder: declared?.placeholder ?? "0",
+      required: true,
+      ...tipFields,
+    };
+  }
+  return {
+    key: "ethValue",
+    label: declared?.label ?? "ETH Value",
+    type: "protocol-eth-value",
+    placeholder: declared?.placeholder ?? "0.0",
+    required: requiredByDefault,
+    ...tipFields,
+  };
+}
+
 function buildConfigFieldsFromAction(
   def: ProtocolDefinition,
   action: ProtocolAction
 ): ActionConfigField[] {
   const contract = def.contracts[action.contract];
-  const allowedChainIds = Object.keys(contract.addresses);
+  // A chain-scoped alias keeps an old slug executing on a chain its declared
+  // contract left (lib/protocol-action-aliases.ts). Those chains belong in the
+  // offered list: this is what the save-time chain-select validation checks a
+  // stored node against and what the builder's chain dropdown renders, so
+  // omitting them makes a Base workflow that still runs unsaveable and blanks
+  // its Network field.
+  const allowedChainIds = Array.from(
+    new Set([
+      ...Object.keys(contract.addresses),
+      ...aliasedChainIds(def, `${def.slug}/${action.slug}`, action),
+    ])
+  );
   const fields: ActionConfigField[] = [
     {
       key: "network",
@@ -417,7 +522,7 @@ function buildConfigFieldsFromAction(
     });
   }
 
-  if (action.payable) {
+  if (action.payable && !action.payableValue?.fromInput) {
     // ETH Value is required only when it is the action's sole meaningful input
     // (e.g. WETH.deposit() takes no args - the native value IS the action).
     // For payable functions that also take arguments, the native value is
@@ -425,18 +530,15 @@ function buildConfigFieldsFromAction(
     // swaps default to ERC20-to-ERC20 with no msg.value, NFT position
     // mint/burn/collect rarely send ETH, etc.).
     const isOnlyInput = action.inputs.length === 0;
-    fields.push({
-      key: "ethValue",
-      label: "ETH Value",
-      type: "protocol-eth-value",
-      placeholder: "0.0",
-      required: isOnlyInput,
-    });
+    fields.push(buildPayableValueField(def, action, isOnlyInput));
   }
 
   const advancedFields: ActionConfigFieldBase[] = [];
 
   for (const input of action.inputs) {
+    if (input.payer) {
+      continue;
+    }
     const field = buildInputField(input);
     if (input.advanced) {
       advancedFields.push(field);
@@ -456,6 +558,7 @@ function buildConfigFieldsFromAction(
         ? { defaultValue: action.gasLimitDefault }
         : {}),
     });
+    advancedFields.push(sponsorGasField());
   }
 
   if (advancedFields.length > 0) {
@@ -480,7 +583,85 @@ function buildConfigFieldsFromAction(
   return fields;
 }
 
+/**
+ * The ABI output parameters of the function an action calls.
+ *
+ * Returns undefined when the contract or function cannot be resolved, which
+ * leaves the caller to fall back rather than guess at a shape.
+ */
+function resolveAbiOutputs(
+  def: ProtocolDefinition,
+  action: ProtocolAction
+): Array<{ name?: string }> | undefined {
+  const contract = def.contracts?.[action.contract];
+  if (!contract?.abi) {
+    return;
+  }
+  try {
+    const parsed = JSON.parse(contract.abi) as Array<{
+      type?: string;
+      name?: string;
+      outputs?: Array<{ name?: string }>;
+    }>;
+    const fn = parsed.find(
+      (entry) => entry.type === "function" && entry.name === action.function
+    );
+    return fn?.outputs;
+  } catch {
+    return;
+  }
+}
+
+/**
+ * Template paths for a read action's return value.
+ *
+ * Delegates to getReadContractOutputFields, the same function the generic
+ * Read Contract action uses, so the two surfaces cannot drift: it already
+ * mirrors structureAbiOutputs (a single named output keyed by its ABI name,
+ * a single unnamed one as the bare value, several keyed by name or
+ * unnamedOutput<i>) and expands tuple components to the same depth the
+ * editor offers. Deriving the paths here a second time is what let tuple
+ * reads suggest `result` while the value was a struct, which a string field
+ * renders as its JSON text rather than the component the user wanted.
+ *
+ * The declared `outputs` overrides supply wording only. Their name used to be
+ * the path, which suggested a field that resolved to undefined whenever the
+ * ABI named nothing; the on-chain ABI is the authority on shape.
+ */
+function buildReadOutputPaths(
+  def: ProtocolDefinition,
+  action: ProtocolAction
+): Array<{ field: string; description: string }> {
+  const contract = def.contracts?.[action.contract];
+  const valueFields = getReadContractOutputFields(
+    contract?.abi,
+    action.function
+  ).filter((f) => f.field === "result" || f.field.startsWith("result."));
+
+  // Map each top-level output's path to its declared label, by position.
+  const abiOutputs = resolveAbiOutputs(def, action) ?? [];
+  const declared = action.outputs ?? [];
+  const topLevelPaths =
+    abiOutputs.length === 1
+      ? [
+          abiOutputs[0].name?.trim()
+            ? `result.${abiOutputs[0].name.trim()}`
+            : "result",
+        ]
+      : abiOutputs.map(
+          (output, index) =>
+            `result.${output.name?.trim() || `unnamedOutput${index}`}`
+        );
+
+  return valueFields.map((field) => {
+    const index = topLevelPaths.indexOf(field.field);
+    const label = index >= 0 ? declared[index]?.label : undefined;
+    return label ? { field: field.field, description: label } : field;
+  });
+}
+
 function buildOutputFieldsFromAction(
+  def: ProtocolDefinition,
   action: ProtocolAction
 ): Array<{ field: string; description: string }> {
   const outputs: Array<{ field: string; description: string }> = [];
@@ -489,10 +670,8 @@ function buildOutputFieldsFromAction(
   // Write actions still have ABI-derived outputs at the model layer, but
   // writeContractCore returns result: undefined, so surfacing them would
   // create template suggestions that resolve to undefined at runtime.
-  if (action.type === "read" && action.outputs) {
-    for (const output of action.outputs) {
-      outputs.push({ field: output.name, description: output.label });
-    }
+  if (action.type === "read") {
+    outputs.push(...buildReadOutputPaths(def, action));
   }
 
   outputs.push({
@@ -530,7 +709,7 @@ export function protocolActionToPluginAction(
     requiresCredentials: action.type === "write",
     ...(action.type === "write" ? { credentialIntegrationType: "web3" } : {}),
     configFields: buildConfigFieldsFromAction(def, action),
-    outputFields: buildOutputFieldsFromAction(action),
+    outputFields: buildOutputFieldsFromAction(def, action),
     ...(action.docUrl ? { docUrl: action.docUrl } : {}),
   };
 }
