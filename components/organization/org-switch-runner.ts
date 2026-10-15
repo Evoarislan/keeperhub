@@ -2,7 +2,13 @@ import { useSyncExternalStore } from "react";
 import { toast } from "sonner";
 import { currentActiveOrgId } from "@/lib/hooks/use-organization";
 
-export type OfferedOrg = { id: string; name: string };
+export type OfferedOrg = {
+  id: string;
+  name: string;
+  // What the switch it is offered again for would have done once made (a
+  // link opening its settings).
+  onSwitched?: () => void;
+};
 
 // The switch state the switchers and the other switches share, in one
 // place. The active org itself is never copied here: it is read from the
@@ -14,10 +20,10 @@ const state = {
   // switches (leaving, deleting or creating one). A leave, delete or create
   // can start while a switch runs; the switchers then wait for both.
   holders: 0,
-  // No organization is active and opening this one failed (the first
-  // switch, or the switch after leaving or deleting one): both switchers
-  // offer it again rather than opening one themselves. Null once one is
-  // active.
+  // No organization is active and a switch to this one failed (the first
+  // open, the open after leaving or deleting one, or a link's switch): both
+  // switchers offer it again rather than opening one themselves. Null once
+  // one is active.
   offeredOrg: null as OfferedOrg | null,
   // The org a running switch asked for from a control that goes away (a
   // toast's Try again, the switcher's state button) is opening: focus goes
@@ -35,7 +41,23 @@ const state = {
   switcherOffering: false,
   // The toast the last switch left; the next switch clears it.
   lastSwitchToast: undefined as string | number | undefined,
+  // The org the server switched to that the page could not show (its
+  // refreshes failed): until the page shows it, the active org the auth
+  // client holds is the old one, and is not taken as active.
+  pageBehindFor: null as string | null,
+  // The org the page showed then (undefined: none). Any other showing ends
+  // it: the page caught up, or moved on to another org (after leaving one,
+  // or a switch in another tab).
+  pageBehindFrom: undefined as string | undefined,
+  // What that switch would have done once made (a link opening its
+  // settings): run once the page shows its org, so it never acts on the old
+  // one. Dropped when another switch starts.
+  afterPageShows: null as (() => void) | null,
 };
+
+// Said when the server switched but the page could not show the new org.
+const PAGE_BEHIND_MESSAGE =
+  "Switched organization, but couldn't update the page.";
 // For a load of the active org asked for from the switcher: whichever org
 // shows takes the focus request.
 const ANY_ORG = "*";
@@ -124,6 +146,19 @@ function setOfferedOrg(org: OfferedOrg | null): void {
 export function noteActiveOrg(orgId: string | null): void {
   if (orgId !== null) {
     state.announceNextOpen = false;
+  }
+  if (
+    orgId !== null &&
+    state.pageBehindFor !== null &&
+    orgId !== state.pageBehindFrom
+  ) {
+    // The page has caught up, or moved on: what the switch was for is done
+    // only where it shows that switch's org.
+    const after = orgId === state.pageBehindFor ? state.afterPageShows : null;
+    state.pageBehindFor = null;
+    state.afterPageShows = null;
+    notify();
+    after?.();
   }
   if (orgId !== null && state.offeredOrg !== null) {
     setOfferedOrg(null);
@@ -249,11 +284,16 @@ function showFailure(
 export function runOrgSwitch(request: SwitchRequest): Promise<boolean | null> {
   const { orgId, name, start, announce, kind = "switch", refocus } = request;
   // Not for an org already active (one the server took though its answer
-  // was lost, or one opened another way meanwhile).
-  if (state.holders > 0 || orgId === currentActiveOrgId()) {
+  // was lost, or one opened another way meanwhile); while the page is
+  // behind, the org it shows is not the server's, so a pick of it runs.
+  if (
+    state.holders > 0 ||
+    (orgId === currentActiveOrgId() && state.pageBehindFor === null)
+  ) {
     return Promise.resolve(null);
   }
   hold();
+  state.afterPageShows = null;
   if (state.lastSwitchToast !== undefined) {
     toast.dismiss(state.lastSwitchToast);
     state.lastSwitchToast = undefined;
@@ -275,24 +315,71 @@ export function runOrgSwitch(request: SwitchRequest): Promise<boolean | null> {
         if (state.offeredOrg !== null) {
           setOfferedOrg(null);
         }
+        // Made on the server; whether the page shows it is another matter.
+        const shown = currentActiveOrgId() === orgId;
+        state.pageBehindFor = shown ? null : orgId;
         release();
-        if (id !== undefined) {
-          state.lastSwitchToast = toast.success(say.success(name), { id });
+        if (shown) {
+          if (id !== undefined) {
+            state.lastSwitchToast = toast.success(say.success(name), { id });
+          }
+          request.onSwitched?.();
+        } else {
+          reportPageBehind(orgId, { id });
+          state.afterPageShows = request.onSwitched ?? null;
         }
-        request.onSwitched?.();
         return true;
       }
       if (state.focusAfterOrgId === orgId) {
         state.focusAfterOrgId = null;
       }
-      // Before the switchers are let go, so none opens an org itself.
-      if (kind === "open") {
-        setOfferedOrg({ id: orgId, name });
+      // Before the switchers are let go, so none opens an org itself: an
+      // open that failed, or any switch with no org active (a link's), is
+      // offered again, with what it would have done once made.
+      if (kind === "open" || currentActiveOrgId() === undefined) {
+        setOfferedOrg({ id: orgId, name, onSwitched: request.onSwitched });
       }
       release();
       showFailure(say.failure(name), { ...request, kind }, id);
       return false;
     });
+}
+
+/**
+ * For a switch the server made (`orgId`) that the page could not show: says
+ * so (`message`, by default that it switched), in place of the switch's own
+ * toast (`id`) or the last one, with a Reload the user chooses. Until the
+ * page shows it, the org it does show is not taken as active. Also for a
+ * switch made outside the switchers (after leaving or deleting an org).
+ */
+export function reportPageBehind(
+  orgId: string,
+  {
+    id,
+    message = PAGE_BEHIND_MESSAGE,
+  }: { id?: string | number; message?: string } = {}
+): void {
+  state.pageBehindFor = orgId;
+  state.pageBehindFrom = currentActiveOrgId();
+  state.afterPageShows = null;
+  if (id === undefined && state.lastSwitchToast !== undefined) {
+    toast.dismiss(state.lastSwitchToast);
+  }
+  state.lastSwitchToast = toast.error(message, {
+    id,
+    duration: 12_000,
+    action: { label: "Reload", onClick: () => window.location.reload() },
+  });
+  notify();
+}
+
+function getPageBehind(): boolean {
+  return state.pageBehindFor !== null;
+}
+
+/** Whether the page shows an org other than the one the server is in. */
+export function usePageBehind(): boolean {
+  return useSyncExternalStore(subscribe, getPageBehind, getPageBehind);
 }
 
 /**
@@ -464,5 +551,8 @@ export function resetOrgSwitchState(): void {
   state.announceNextOpen = false;
   state.switcherOffering = false;
   state.lastSwitchToast = undefined;
+  state.pageBehindFor = null;
+  state.pageBehindFrom = undefined;
+  state.afterPageShows = null;
   notify();
 }

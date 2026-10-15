@@ -2,7 +2,9 @@ import { toast } from "sonner";
 import {
   holdOrgSwitching,
   reportOpenFailure,
+  reportPageBehind,
 } from "@/components/organization/org-switch-runner";
+import { currentActiveOrgId } from "@/lib/hooks/use-organization";
 import { refetchOrganizations } from "@/lib/refetch-organizations";
 
 type Org = { id: string; name: string };
@@ -62,7 +64,15 @@ export async function switchAwayFrom({
     return opened;
   });
   if (switched) {
-    toast.success(`${done} ${removed.name}. Now in ${next.name}.`);
+    // Made on the server; the page may not have caught up with it.
+    if (currentActiveOrgId() === next.id) {
+      toast.success(`${done} ${removed.name}. Now in ${next.name}.`);
+    } else {
+      // Still says the leave or delete went through.
+      reportPageBehind(next.id, {
+        message: `${done} ${removed.name}. Now in ${next.name}, but couldn't update the page.`,
+      });
+    }
     return;
   }
   goHome?.();

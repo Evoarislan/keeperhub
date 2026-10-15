@@ -25,6 +25,7 @@ import {
   useOfferedOrg,
   useOrgReloading,
   useOrgSwitching,
+  usePageBehind,
 } from "@/components/organization/org-switch-runner";
 import { Button } from "@/components/ui/button";
 import {
@@ -199,6 +200,7 @@ export function OrgSwitcher({
     refetch: refetchOrg,
   } = useOrganization();
   const reloading = useOrgReloading();
+  const pageBehind = usePageBehind();
   const {
     organizations,
     isLoading: orgsLoading,
@@ -237,6 +239,7 @@ export function OrgSwitcher({
         announce: asked,
         kind: "open",
         refocus: asked && !inMenu,
+        onSwitched: org.onSwitched,
       });
     },
     [switchOrganization, inMenu]
@@ -305,7 +308,10 @@ export function OrgSwitcher({
       loadFailed ||
       listFailed ||
       reloading ||
-      busy;
+      busy ||
+      // The server is in the org a switch made, which the page has not shown
+      // yet: opening another would take the user from it.
+      pageBehind;
     if (
       !(waiting || offered || autoSwitchTried.current) &&
       organizations.length > 0
@@ -330,6 +336,7 @@ export function OrgSwitcher({
     loadFailed,
     listFailed,
     reloading,
+    pageBehind,
     busy,
     offered,
     inMenu,
@@ -551,7 +558,9 @@ export function OrgSwitcher({
                     menu?.onPick(true);
                     // The org in use is not switched to again: that would
                     // only clear the workflow editor and open another one.
-                    if (org.id === organization.id) {
+                    // Unless the page is behind the server: then the org
+                    // it shows is not the one in use, and the pick runs.
+                    if (org.id === organization.id && !pageBehind) {
                       return;
                     }
                     runOrgSwitch({

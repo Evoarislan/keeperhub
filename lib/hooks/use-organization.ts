@@ -3,7 +3,6 @@
 import { useSetAtom } from "jotai";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect } from "react";
-import { toast } from "sonner";
 import { invalidateFeatureSnapshot } from "@/hooks/use-features";
 import { api } from "@/lib/api-client";
 import { analyticsProjectIdAtom } from "@/lib/atoms/analytics";
@@ -25,27 +24,31 @@ type ActiveOrgState = {
 // waits before each.
 const SHOW_RETRY_DELAYS_MS = [500, 1500];
 
-// Said when the server switched but the page could not show the new org.
-const PAGE_BEHIND_MESSAGE =
-  "Switched organization, but couldn't update the page.";
-
 // The auth client starts its own refresh of the active org a few
 // milliseconds after an organization request answers (setActive among
 // them); a switch waits this long for it before asking for one itself.
 const OWN_REFRESH_GRACE_MS = 100;
-// However a refresh goes, one wait for it lasts no longer than this.
-const SHOW_WAIT_LIMIT_MS = 10_000;
+// One wait for a refresh lasts no longer than this (a refresh that hangs).
+const SHOW_WAIT_LIMIT_MS = 2500;
+// And a switch waits for its org to show no longer than this in all.
+const SHOW_TOTAL_LIMIT_MS = 8000;
 
 /**
  * Resolves once the auth client's active org is `orgId` (true), or once a
- * refresh has answered without it (false). Waits `askAfterMs` for a refresh
- * the auth client starts itself before asking for one, so a switch does
- * not load the active org twice; asks at once where nothing else will.
+ * refresh has answered without it, or `limitMs` has passed (false). The
+ * first wait gives the auth client `askAfterMs` to start its own refresh
+ * before asking for one, so a switch does not load the active org twice; a
+ * retry (`ask`) sends its own request at once, so one that hangs is not
+ * waited on again.
  */
 function whenActiveOrgShows(
   orgId: string,
   refetch: () => Promise<unknown>,
-  askAfterMs: number
+  {
+    askAfterMs,
+    ask,
+    limitMs,
+  }: { askAfterMs: number; ask: boolean; limitMs: number }
 ): Promise<boolean> {
   const atom = authClient.$store.atoms.activeOrganization;
   return new Promise((resolve) => {
@@ -72,14 +75,15 @@ function whenActiveOrgShows(
     };
     unlisten = atom.listen(check);
     check(atom.get());
-    // None under way by then (or the auth client's has been and gone):
-    // ask for one.
+    // A retry's own request, or, for the first wait, one where none is
+    // under way by then (or the auth client's has been and gone).
     setTimeout(() => {
-      if (!(settled || started)) {
+      if (!settled && (ask || !started)) {
+        started = true;
         refetch();
       }
     }, askAfterMs);
-    limit = setTimeout(() => finish(false), SHOW_WAIT_LIMIT_MS);
+    limit = setTimeout(() => finish(false), limitMs);
   });
 }
 
@@ -146,31 +150,32 @@ export function useOrganization() {
       if (switchError) {
         return false;
       }
-      // Resolves once the new org is the one shown, so callers (and the
-      // switchers waiting on them) never act on a page with no org active.
-      // A refresh that did not show it (a blip) is asked for again, a
-      // little later. The server has switched either way, and every request
-      // now runs as the new org, so the switch is made; should the page
-      // still not show it, that is said, with a reload to bring it up to
-      // date, as the header would otherwise name the org the user left.
+      // Resolves once the new org is the one shown (or its wait is over),
+      // so callers (and the switchers waiting on them) never act on a page
+      // with no org active. A refresh that did not show it (a blip, or one
+      // that hangs) is asked for again, a little later, with a request of
+      // its own, all within SHOW_TOTAL_LIMIT_MS. The server has switched
+      // either way, and every request now runs as the new org, so the
+      // switch is made; whether the page shows it, the caller reads from
+      // the auth client (the switch runner says when it does not).
+      const deadline = Date.now() + SHOW_TOTAL_LIMIT_MS;
+      const waitFor = (askAfterMs: number, ask: boolean): Promise<boolean> =>
+        whenActiveOrgShows(orgId, refetch, {
+          askAfterMs,
+          ask,
+          limitMs: Math.min(
+            SHOW_WAIT_LIMIT_MS,
+            Math.max(0, deadline - Date.now())
+          ),
+        });
       // First the refresh the auth client starts itself after setActive.
-      let shown = await whenActiveOrgShows(
-        orgId,
-        refetch,
-        OWN_REFRESH_GRACE_MS
-      );
+      let shown = await waitFor(OWN_REFRESH_GRACE_MS, false);
       for (const delay of SHOW_RETRY_DELAYS_MS) {
-        if (shown) {
+        if (shown || deadline - Date.now() <= delay) {
           break;
         }
         await new Promise((resolve) => setTimeout(resolve, delay));
-        shown = await whenActiveOrgShows(orgId, refetch, 0);
-      }
-      if (!shown) {
-        toast.error(PAGE_BEHIND_MESSAGE, {
-          duration: 12_000,
-          action: { label: "Reload", onClick: () => window.location.reload() },
-        });
+        shown = await waitFor(0, true);
       }
       const open = (href: string, replace: boolean): void => {
         if (replace) {

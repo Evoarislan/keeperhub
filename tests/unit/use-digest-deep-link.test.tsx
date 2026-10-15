@@ -16,6 +16,8 @@ const mocks = vi.hoisted(() => ({
     { id: "org-2", name: "Beta" },
   ] as Org[],
   switchOrganization: vi.fn(),
+  // The org the auth client holds once a switch has shown it.
+  serverOrg: undefined as string | undefined,
   listFailed: false,
   reloadList: vi.fn(() => Promise.resolve(true)),
   error: vi.fn(),
@@ -33,12 +35,21 @@ vi.mock("sonner", () => ({
     dismiss: vi.fn(),
   },
 }));
+// A switch that took, as the app's resolves: once its org is the one shown.
+async function switchShowing(orgId: string): Promise<boolean> {
+  const switched = await mocks.switchOrganization(orgId);
+  if (switched) {
+    mocks.serverOrg = orgId;
+  }
+  return switched;
+}
+
 vi.mock("@/lib/hooks/use-organization", () => ({
-  currentActiveOrgId: () => mocks.organization?.id,
+  currentActiveOrgId: () => mocks.serverOrg ?? mocks.organization?.id,
   useOrganization: () => ({
     organization: mocks.organization,
     isLoading: mocks.orgLoading,
-    switchOrganization: mocks.switchOrganization,
+    switchOrganization: switchShowing,
   }),
   useOrganizations: () => ({
     organizations: mocks.listFailed ? [] : mocks.organizations,
@@ -99,6 +110,7 @@ async function render(): Promise<void> {
 beforeEach(() => {
   vi.clearAllMocks();
   resetOrgSwitchState();
+  mocks.serverOrg = undefined;
   noteActiveOrg("org-1");
   enabled = true;
   arrive("digestSettings=org-2");

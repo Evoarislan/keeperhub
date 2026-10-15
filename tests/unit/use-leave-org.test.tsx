@@ -46,10 +46,22 @@ vi.mock("@/lib/auth-client", () => ({
   },
   useSession: () => ({ data: { user: { id: "me" } } }),
 }));
+// A switch that took, as the app's resolves: once its org is the one shown.
+async function switchShowing(
+  orgId: string,
+  fromPath?: string
+): Promise<boolean> {
+  const switched = await mocks.switchOrganization(orgId, fromPath);
+  if (switched) {
+    mocks.active = { id: orgId, name: "" };
+  }
+  return switched;
+}
+
 vi.mock("@/lib/hooks/use-organization", () => ({
   currentActiveOrgId: () => mocks.active?.id,
   useOrganization: () => ({
-    switchOrganization: mocks.switchOrganization,
+    switchOrganization: switchShowing,
   }),
   useOrganizations: () => ({
     organizations: [

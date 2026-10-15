@@ -14,6 +14,10 @@ const mocks = vi.hoisted(() => ({
   toastSuccess: vi.fn(),
   toastError: vi.fn(),
   toastDismiss: vi.fn(),
+  // The org a switch took, once shown (as the auth client holds it).
+  serverOrg: undefined as string | undefined,
+  // A switch the server takes does not show (its refreshes fail).
+  pageStale: false,
   toastInfo: vi.fn(),
   // The active org's request failed (not: no org active).
   orgError: null as Error | null,
@@ -31,11 +35,21 @@ vi.mock("@/lib/auth-client", () => ({
     data: { user: { name: "Dana", email: "dana@example.com" } },
   }),
 }));
+// A switch that took, as the app's resolves: once its org is the one shown
+// (as the auth client holds it), unless the page is made to fall behind.
+async function switchShowing(orgId: string): Promise<boolean> {
+  const switched = await mocks.switchOrganization(orgId);
+  if (switched && !mocks.pageStale) {
+    mocks.serverOrg = orgId;
+  }
+  return switched;
+}
+
 vi.mock("@/lib/hooks/use-organization", () => ({
-  currentActiveOrgId: () => mocks.organization?.id,
+  currentActiveOrgId: () => mocks.serverOrg ?? mocks.organization?.id,
   useOrganization: () => ({
     organization: mocks.organization,
-    switchOrganization: mocks.switchOrganization,
+    switchOrganization: switchShowing,
     isLoading: false,
     loadFailed: mocks.orgError !== null,
     refetch: mocks.refetchOrg,
@@ -109,6 +123,8 @@ const getClientRects = HTMLElement.prototype.getClientRects;
 beforeEach(() => {
   // The switch state is shared by every switcher, so a fresh page each test.
   resetOrgSwitchState();
+  mocks.serverOrg = undefined;
+  mocks.pageStale = false;
   HTMLElement.prototype.getClientRects = () =>
     [new DOMRect(0, 0, 1, 1)] as unknown as DOMRectList;
   setWidth(390);
@@ -721,6 +737,7 @@ describe("OrgSwitcher", () => {
     it("announces a switch below lg, where initials can stand in", async () => {
       for (const width of [390, 1023]) {
         vi.clearAllMocks();
+        mocks.serverOrg = undefined;
         setWidth(width);
         mocks.organizations = TWO_ORGS;
         stubListMeasuring();
@@ -737,6 +754,7 @@ describe("OrgSwitcher", () => {
     it("only closes for the org already in use, at any width", async () => {
       for (const width of [1023, 1024]) {
         vi.clearAllMocks();
+        mocks.serverOrg = undefined;
         setWidth(width);
         mocks.organizations = TWO_ORGS;
         stubListMeasuring();
@@ -1026,6 +1044,234 @@ describe("OrgSwitcher", () => {
         container.querySelector<HTMLButtonElement>("[data-state=failed]")
           ?.disabled
       ).toBe(true);
+    });
+  });
+
+  describe("a switch someone else ran that failed with no org active", () => {
+    it("offers its org, keeps its failure, and opens no other", async () => {
+      // A digest link's plain switch to Beta, with no org active.
+      mocks.organization = null;
+      mocks.organizations = TWO_ORGS;
+      let answer: (switched: boolean) => void = () => undefined;
+      mocks.switchOrganization.mockReturnValueOnce(
+        new Promise((resolve) => {
+          answer = resolve;
+        })
+      );
+      mocks.toastError.mockReturnValueOnce("toast-failed");
+      const onSwitched = vi.fn();
+      // The link's switch holds the switchers as the page comes up.
+      const switching = runOrgSwitch({
+        orgId: "org-2",
+        name: "Beta Corp",
+        start: () => mocks.switchOrganization("org-2"),
+        announce: true,
+        onSwitched,
+      });
+      act(() => root.render(<OrgSwitcher />));
+      // It fails.
+      await act(async () => {
+        answer(false);
+        await switching;
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      await settle();
+      // Not Acme opened over it, its failure toast cleared.
+      expect(mocks.switchOrganization).not.toHaveBeenCalledWith("org-1");
+      expect(mocks.toastDismiss).not.toHaveBeenCalledWith("toast-failed");
+      const offer = container.querySelector<HTMLButtonElement>(
+        "[data-state=failed]"
+      );
+      expect(offer?.getAttribute("aria-label")).toBe(
+        "Try again: open Beta Corp"
+      );
+      // Opening it from the switcher still does what the link was for.
+      mocks.switchOrganization.mockResolvedValueOnce(true);
+      await act(async () => {
+        offer?.click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      // Beta again (the failed try, then this one).
+      expect(
+        mocks.switchOrganization.mock.calls.filter(([id]) => id === "org-2")
+      ).toHaveLength(2);
+      expect(onSwitched).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe("a switch the page could not show", () => {
+    it("says the page is behind, not that it switched, and lets the org shown be picked", async () => {
+      setWidth(390);
+      mocks.organizations = TWO_ORGS;
+      // The server takes the switch; the page's refreshes all fail.
+      mocks.pageStale = true;
+      mocks.switchOrganization.mockResolvedValueOnce(true);
+      stubListMeasuring();
+      const switcher = render();
+      openList(switcher);
+      await pick("Beta Corp");
+      expect(mocks.toastSuccess).not.toHaveBeenCalled();
+      // In place of "Switching to Beta Corp...", not beside it.
+      const loading = mocks.toastLoading.mock.results[0]?.value;
+      expect(loading).toBeDefined();
+      expect(mocks.toastError).toHaveBeenCalledWith(
+        "Switched organization, but couldn't update the page.",
+        expect.objectContaining({
+          id: loading,
+          duration: 12_000,
+          action: expect.objectContaining({ label: "Reload" }),
+        })
+      );
+      const behindToast = mocks.toastError.mock.results.at(-1)?.value;
+      // The header still names Acme, which the server is no longer in:
+      // picking it runs a switch (and clears the toast) rather than nothing.
+      mocks.pageStale = false;
+      mocks.switchOrganization.mockResolvedValueOnce(true);
+      openList(render());
+      await pick("Acme Labs");
+      expect(mocks.switchOrganization).toHaveBeenLastCalledWith("org-1");
+      expect(mocks.toastDismiss).toHaveBeenCalledWith(behindToast);
+      // Acme shows and is in use again: picking it once more only closes
+      // the list.
+      openList(render());
+      await pick("Acme Labs");
+      expect(mocks.switchOrganization).toHaveBeenCalledTimes(2);
+    });
+
+    it("takes the org in use as active again once the page moves on to another", async () => {
+      setWidth(390);
+      const gamma = { id: "org-3", name: "Gamma Inc" };
+      mocks.organizations = [...TWO_ORGS, gamma];
+      // A switch to Beta the page could not show: it still shows Acme.
+      mocks.pageStale = true;
+      mocks.switchOrganization.mockResolvedValueOnce(true);
+      stubListMeasuring();
+      openList(render());
+      await pick("Beta Corp");
+      // Then it shows Gamma (Acme left, and Gamma opened).
+      mocks.pageStale = false;
+      mocks.organization = gamma;
+      mocks.serverOrg = "org-3";
+      openList(render());
+      // Gamma is in use: picking it only closes the list.
+      await pick("Gamma Inc");
+      expect(mocks.switchOrganization).not.toHaveBeenCalledWith("org-3");
+    });
+  });
+
+  describe("a switch the page could not show, with no org shown", () => {
+    it("opens no other org over it", async () => {
+      // A digest link's switch to Beta with no org active: the server takes
+      // it; the page still shows none.
+      mocks.organization = null;
+      mocks.organizations = TWO_ORGS;
+      mocks.pageStale = true;
+      let answer: (switched: boolean) => void = () => undefined;
+      mocks.switchOrganization.mockReturnValueOnce(
+        new Promise((resolve) => {
+          answer = resolve;
+        })
+      );
+      mocks.toastError.mockReturnValueOnce("toast-behind");
+      const switching = runOrgSwitch({
+        orgId: "org-2",
+        name: "Beta Corp",
+        start: () => switchShowing("org-2"),
+        announce: true,
+      });
+      act(() => root.render(<OrgSwitcher />));
+      await act(async () => {
+        answer(true);
+        await switching;
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      await settle();
+      // Not Acme opened over it (taking the server from Beta), its toast
+      // left up.
+      expect(mocks.switchOrganization).not.toHaveBeenCalledWith("org-1");
+      expect(mocks.toastDismiss).not.toHaveBeenCalledWith("toast-behind");
+    });
+  });
+
+  describe("a link's switch the page could not show", () => {
+    it("does what the link was for only once the page shows its org", async () => {
+      mocks.organizations = TWO_ORGS;
+      mocks.pageStale = true;
+      mocks.switchOrganization.mockResolvedValueOnce(true);
+      act(() => root.render(<OrgSwitcher />));
+      const onSwitched = vi.fn();
+      // A digest link's switch to Beta: made, but the page still shows Acme.
+      await act(async () => {
+        await runOrgSwitch({
+          orgId: "org-2",
+          name: "Beta Corp",
+          start: () => switchShowing("org-2"),
+          announce: true,
+          onSwitched,
+        });
+      });
+      // Not its settings opened on Acme's page.
+      expect(onSwitched).not.toHaveBeenCalled();
+      // The page catches up: now it opens them, once.
+      mocks.organization = { id: "org-2", name: "Beta Corp" };
+      act(() => root.render(<OrgSwitcher />));
+      expect(onSwitched).toHaveBeenCalledOnce();
+      act(() => root.render(<OrgSwitcher />));
+      expect(onSwitched).toHaveBeenCalledOnce();
+    });
+
+    it("drops what the link was for once another switch starts", async () => {
+      mocks.organizations = TWO_ORGS;
+      mocks.pageStale = true;
+      mocks.switchOrganization.mockResolvedValue(true);
+      act(() => root.render(<OrgSwitcher />));
+      const onSwitched = vi.fn();
+      await act(async () => {
+        await runOrgSwitch({
+          orgId: "org-2",
+          name: "Beta Corp",
+          start: () => switchShowing("org-2"),
+          announce: true,
+          onSwitched,
+        });
+      });
+      // The user picks Acme, the org the page shows, which fails; then Beta
+      // shows: the link's settings are not opened on their own.
+      await act(async () => {
+        await runOrgSwitch({
+          orgId: "org-1",
+          name: "Acme Labs",
+          start: () => Promise.resolve(false),
+          announce: false,
+        });
+      });
+      mocks.organization = { id: "org-2", name: "Beta Corp" };
+      act(() => root.render(<OrgSwitcher />));
+      expect(onSwitched).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("a link's switch the page could not show, then another org", () => {
+    it("does not do what the link was for on another org's page", async () => {
+      const gamma = { id: "org-3", name: "Gamma Inc" };
+      mocks.organizations = [...TWO_ORGS, gamma];
+      mocks.pageStale = true;
+      mocks.switchOrganization.mockResolvedValueOnce(true);
+      act(() => root.render(<OrgSwitcher />));
+      const onSwitched = vi.fn();
+      await act(async () => {
+        await runOrgSwitch({
+          orgId: "org-2",
+          name: "Beta Corp",
+          start: () => switchShowing("org-2"),
+          announce: true,
+          onSwitched,
+        });
+      });
+      // The page moves on to Gamma (a switch in another tab), not Beta.
+      mocks.organization = gamma;
+      act(() => root.render(<OrgSwitcher />));
+      expect(onSwitched).not.toHaveBeenCalled();
     });
   });
 

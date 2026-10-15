@@ -40,6 +40,12 @@ import { switchAwayFrom } from "@/components/organization/switch-away";
 const ACME = { id: "org-1", name: "Acme" };
 const BETA = { id: "org-2", name: "Beta" };
 
+// A switch that took, as the app's resolves: once its org is the one shown.
+function shows(orgId: string): Promise<boolean> {
+  mocks.activeOrgId = orgId;
+  return Promise.resolve(true);
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   resetOrgSwitchState();
@@ -61,12 +67,26 @@ function run(switchOrganization: (orgId: string) => Promise<boolean>) {
 
 describe("switchAwayFrom", () => {
   it("opens another organization and says where", async () => {
-    const switchOrganization = vi.fn(() => Promise.resolve(true));
+    const switchOrganization = vi.fn(shows);
     const { done, goHome } = run(switchOrganization);
     await done;
     // From the page shown: no caller here is leaving it.
     expect(switchOrganization).toHaveBeenCalledWith("org-2", undefined);
     expect(mocks.success).toHaveBeenCalledWith("Left Acme. Now in Beta.");
+    expect(goHome).not.toHaveBeenCalled();
+  });
+
+  it("says it left, and that the page is behind, when it could not show the org it opened", async () => {
+    // The server took the switch; the page still shows none.
+    const { done, goHome } = run(() => Promise.resolve(true));
+    await done;
+    expect(mocks.success).not.toHaveBeenCalled();
+    expect(mocks.error).toHaveBeenCalledWith(
+      "Left Acme. Now in Beta, but couldn't update the page.",
+      expect.objectContaining({
+        action: expect.objectContaining({ label: "Reload" }),
+      })
+    );
     expect(goHome).not.toHaveBeenCalled();
   });
 
@@ -111,7 +131,7 @@ describe("switchAwayFrom", () => {
   });
 
   it("only says what was done when there is nowhere else to go", async () => {
-    const switchOrganization = vi.fn(() => Promise.resolve(true));
+    const switchOrganization = vi.fn(shows);
     await switchAwayFrom({
       removed: ACME,
       wasActive: true,
@@ -157,7 +177,7 @@ describe("switchAwayFrom", () => {
     const switchOrganization = vi
       .fn()
       .mockResolvedValueOnce(false)
-      .mockResolvedValueOnce(true);
+      .mockImplementationOnce(shows);
     await switchAwayFrom({
       removed: ACME,
       wasActive: true,
@@ -180,7 +200,7 @@ describe("switchAwayFrom", () => {
   });
 
   it("only says what was done when the org was not the active one", async () => {
-    const switchOrganization = vi.fn(() => Promise.resolve(true));
+    const switchOrganization = vi.fn(shows);
     await switchAwayFrom({
       removed: ACME,
       wasActive: false,
@@ -196,7 +216,7 @@ describe("switchAwayFrom", () => {
     const switchOrganization = vi
       .fn()
       .mockResolvedValueOnce(false)
-      .mockResolvedValueOnce(true);
+      .mockImplementationOnce(shows);
     await switchAwayFrom({
       removed: ACME,
       wasActive: true,

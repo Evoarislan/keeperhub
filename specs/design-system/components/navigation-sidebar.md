@@ -191,11 +191,18 @@ select inside the panel closes only that.
   returns to them after a pick. A switch waits for the new organization to
   show, through the refresh of the active organization the auth client starts
   itself (waiting briefly for it, so no second request). A refresh that did
-  not show it (a timeout, rate limiting) is asked for again, twice, a little
-  later. The server has switched either way, so the switch is made, and the
-  page is never loaded afresh on its own: should it still show the old
-  organization, it says "Switched organization, but couldn't update the page."
-  (12s) with Reload. After the active organization goes away, the list is
+  not show it (a timeout, rate limiting, or one that hangs) is asked for
+  again, twice, a little later, each time with a request of its own; the wait
+  ends after about 8s whatever happens. The server has switched either way,
+  so the switch is made, and the page is never loaded afresh on its own:
+  should it still show the old organization, it says "Switched organization,
+  but couldn't update the page." (12s, with Reload) instead of "Switched to
+  X" (after leaving or deleting: "Left X. Now in Y, but couldn't update the
+  page."), and picking the organization it shows switches to it again rather
+  than only closing the list, until the page shows another. A digest link
+  then opens its settings only once the page shows its organization, and not
+  after another switch has started; with none shown, the switcher opens no
+  other meanwhile. After the active organization goes away, the list is
   loaded afresh before the switcher opens another, so it does not reopen the
   one that went. The settings page's switch to the organization in its URL,
   and the digest email's link, run the same way, once the active organization,
@@ -213,7 +220,8 @@ select inside the panel closes only that.
   which makes it the active one, runs under the lock. The next switch clears
   the last one's toast.
 - At any width, picking the organization in use only closes the list (and
-  the drawer): switching to it again would clear the workflow editor.
+  the drawer): switching to it again would clear the workflow editor. The
+  page being behind (above) is the exception.
 - A failed switch changes nothing. A switch from a workflow opens the new
   organization's last-edited workflow (never `__current__` or a deleted one).
   Leaving or deleting one that is not active only says so ("Left X").
@@ -230,7 +238,9 @@ select inside the panel closes only that.
   is no such organization (deleted, or the user removed from it) counts as
   none active.
   If that fails ("Couldn't open X.", with Try again), or opening another
-  after leaving or deleting fails, both switchers (header and menu) offer
+  after leaving or deleting fails, or any switch fails while none is active
+  (a digest link's, say, whose failure then stays, and no other organization
+  is opened over it), both switchers (header and menu) offer
   that organization: "Open X" with a retry mark (the mark alone in a phone's
   header), named "Try again: open X" at every width, announced when used. A
   768-1023px window with a mouse shows the header switcher while it offers

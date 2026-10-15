@@ -321,6 +321,51 @@ describe("switchOrganization", () => {
     }
   });
 
+  it("asks again with its own request when the refresh hangs, within the limit", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      // The auth client's own refresh after setActive never answers.
+      mocks.setActive.mockImplementation(async () => {
+        setTimeout(() => {
+          activeOrg.set({ ...activeOrg.get(), isRefetching: true });
+        }, 10);
+        return { data: { id: "org-2" }, error: null };
+      });
+      const switching = switchOrganization("org-2");
+      // The first wait ends; the retry sends a request of its own.
+      await vi.advanceTimersByTimeAsync(3200);
+      expect(mocks.refetchActive).toHaveBeenCalledOnce();
+      expect(await switching).toBe(true);
+      expect(activeOrg.get().data?.id).toBe("org-2");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ends within the limit when every request hangs", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      mocks.setActive.mockResolvedValue({ data: { id: "org-2" }, error: null });
+      // Every refresh hangs.
+      mocks.refetchActive.mockImplementation(() => {
+        activeOrg.set({ ...activeOrg.get(), isRefetching: true });
+        return new Promise(() => undefined);
+      });
+      let settled = false;
+      const switching = switchOrganization("org-2").then((switched) => {
+        settled = true;
+        return switched;
+      });
+      await vi.advanceTimersByTimeAsync(8200);
+      expect(settled).toBe(true);
+      // The made switch is made; each retry sent its own request.
+      expect(await switching).toBe(true);
+      expect(mocks.refetchActive.mock.calls.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("counts a switch the server made as made, though the page could not show it", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
@@ -339,15 +384,9 @@ describe("switchOrganization", () => {
       expect(mocks.refetchActive).toHaveBeenCalledTimes(3);
       expect(mocks.resetEditor).toHaveBeenCalledOnce();
       expect(mocks.replace).toHaveBeenCalledWith("/workflows/edited");
-      // The header still names the old org: said, with a reload the user
-      // chooses.
-      expect(mocks.toastError).toHaveBeenCalledWith(
-        "Switched organization, but couldn't update the page.",
-        expect.objectContaining({
-          duration: 12_000,
-          action: expect.objectContaining({ label: "Reload" }),
-        })
-      );
+      // The page still shows the old org: the caller reads that from the
+      // auth client and says so (the switch runner, with Reload).
+      expect(activeOrg.get().data?.id).toBe("org-1");
     } finally {
       vi.useRealTimers();
     }
