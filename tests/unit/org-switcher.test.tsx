@@ -449,6 +449,31 @@ describe("OrgSwitcher", () => {
     expect(container.querySelector("[data-state=failed]")).not.toBeNull();
   });
 
+  it("opens one itself once a switch someone else ran with no org active has failed", async () => {
+    // A link's plain switch with no org active, holding the switchers.
+    mocks.organization = null;
+    mocks.organizations = [{ id: "org-1", name: "Acme Labs" }];
+    let done: () => void = () => undefined;
+    const held = holdOrgSwitching(
+      () =>
+        new Promise<void>((resolve) => {
+          done = resolve;
+        })
+    );
+    await act(async () => {
+      root.render(<OrgSwitcher />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(mocks.switchOrganization).not.toHaveBeenCalled();
+    // It failed, offering nothing: the switcher is not left on Loading.
+    await act(async () => {
+      done();
+      await held;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(mocks.switchOrganization).toHaveBeenCalledWith("org-1");
+  });
+
   it("opens one again when the active org goes a second time", async () => {
     mocks.switchOrganization.mockResolvedValue(true);
     mocks.organization = null;
@@ -465,7 +490,17 @@ describe("OrgSwitcher", () => {
       root.render(<OrgSwitcher />);
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
+    // The list may still hold the org that went: it is loaded afresh first.
+    expect(mocks.reloadList).toHaveBeenCalledOnce();
+    expect(mocks.switchOrganization).toHaveBeenCalledOnce();
+    // It arrives, without the org that went.
+    mocks.organizations = [{ id: "org-2", name: "Beta Corp" }];
+    await act(async () => {
+      root.render(<OrgSwitcher />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
     expect(mocks.switchOrganization).toHaveBeenCalledTimes(2);
+    expect(mocks.switchOrganization).toHaveBeenLastCalledWith("org-2");
   });
 
   it("offers to open the org in both switchers after a failed first switch", async () => {
@@ -994,6 +1029,29 @@ describe("OrgSwitcher", () => {
     });
   });
 
+  describe("a switch with no switcher mounted", () => {
+    it("knows the org already active from the auth client", async () => {
+      mocks.organization = { id: "org-2", name: "Beta Corp" };
+      // Nothing mounted (a bare layout): still not run for the active org.
+      expect(
+        await runOrgSwitch({
+          orgId: "org-2",
+          name: "Beta Corp",
+          start: () => Promise.resolve(true),
+          announce: false,
+        })
+      ).toBeNull();
+      expect(
+        await runOrgSwitch({
+          orgId: "org-3",
+          name: "Gamma",
+          start: () => Promise.resolve(true),
+          announce: false,
+        })
+      ).toBe(true);
+    });
+  });
+
   describe("the switch lock", () => {
     it("stays held until every holder is done", async () => {
       let answer: (switched: boolean) => void = () => undefined;
@@ -1407,6 +1465,10 @@ describe("OrgSwitcher", () => {
       mocks.organizations = [{ id: "org-2", name: "Beta Corp" }];
       act(() => root.render(<OrgSwitcher />));
       await settle();
+      // The list, loaded afresh, arrives (a new answer).
+      mocks.organizations = [...(mocks.organizations ?? [])];
+      act(() => root.render(<OrgSwitcher />));
+      await settle();
       expect(mocks.switchOrganization).toHaveBeenLastCalledWith("org-2");
       expect(mocks.toastLoading).not.toHaveBeenCalledWith(
         "Opening Beta Corp..."
@@ -1603,6 +1665,10 @@ describe("OrgSwitcher", () => {
       // Later the user is removed from it, another org listed.
       mocks.organization = null;
       mocks.organizations = [{ id: "org-2", name: "Beta Corp" }];
+      act(() => root.render(<OrgSwitcher />));
+      await settle();
+      // The list, loaded afresh, arrives (a new answer).
+      mocks.organizations = [...(mocks.organizations ?? [])];
       act(() => root.render(<OrgSwitcher />));
       await settle();
       expect(mocks.switchOrganization).toHaveBeenLastCalledWith("org-2");

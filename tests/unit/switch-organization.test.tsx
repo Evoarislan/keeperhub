@@ -13,7 +13,8 @@ const mocks = vi.hoisted(() => ({
   resetEditor: vi.fn(),
   invalidateFeatures: vi.fn(),
   refetchActive: vi.fn(),
-  // The org the page shows after its reload.
+  toastError: vi.fn(),
+  // The org the auth client's refresh answers with.
   shown: "org-2" as string | null,
   // The active org's request's error, as the auth client gives it.
   activeError: null as { status?: number } | null,
@@ -26,6 +27,52 @@ vi.mock("next/navigation", () => ({
     refresh: mocks.refresh,
   }),
 }));
+// The auth client's active-org atom, as a small store: its value, and who
+// listens.
+const activeOrg = vi.hoisted(() => {
+  type Value = {
+    data: { id: string } | null;
+    error: { status?: number } | null;
+    isPending: boolean;
+    isRefetching: boolean;
+  };
+  const listeners = new Set<(value: Value) => void>();
+  const store = {
+    value: {
+      data: { id: "org-1" },
+      error: null,
+      isPending: false,
+      isRefetching: false,
+    } as Value,
+    get: (): Value => store.value,
+    set: (value: Value): void => {
+      store.value = value;
+      for (const listener of listeners) {
+        listener(value);
+      }
+    },
+    listen: (listener: (value: Value) => void): (() => void) => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+  };
+  return store;
+});
+
+// A refresh of the active org: under way, then answered with `mocks.shown`.
+async function refreshActive(): Promise<void> {
+  activeOrg.set({ ...activeOrg.get(), isRefetching: true });
+  await Promise.resolve();
+  activeOrg.set({
+    data: mocks.shown ? { id: mocks.shown } : activeOrg.get().data,
+    error: mocks.activeError,
+    isPending: false,
+    isRefetching: false,
+  });
+}
+
 vi.mock("@/lib/auth-client", () => ({
   authClient: {
     useActiveOrganization: () => ({
@@ -35,18 +82,10 @@ vi.mock("@/lib/auth-client", () => ({
       refetch: mocks.refetchActive,
     }),
     organization: { setActive: mocks.setActive },
-    $store: {
-      atoms: {
-        activeOrganization: {
-          get: () => ({
-            data: mocks.shown ? { id: mocks.shown } : null,
-            error: mocks.activeError,
-          }),
-        },
-      },
-    },
+    $store: { atoms: { activeOrganization: activeOrg } },
   },
 }));
+vi.mock("sonner", () => ({ toast: { error: mocks.toastError } }));
 vi.mock("@/hooks/use-features", () => ({
   invalidateFeatureSnapshot: mocks.invalidateFeatures,
 }));
@@ -100,6 +139,14 @@ beforeEach(() => {
   vi.clearAllMocks();
   window.history.pushState({}, "", "/hub");
   mocks.shown = "org-2";
+  mocks.activeError = null;
+  activeOrg.value = {
+    data: { id: "org-1" },
+    error: null,
+    isPending: false,
+    isRefetching: false,
+  };
+  mocks.refetchActive.mockImplementation(refreshActive);
   container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
@@ -203,22 +250,107 @@ describe("switchOrganization", () => {
   });
 
   it("resolves only once the new org is the one shown", async () => {
-    let loaded: () => void = () => undefined;
-    mocks.refetchActive.mockReturnValueOnce(
-      new Promise<void>((resolve) => {
-        loaded = resolve;
-      })
-    );
+    let answer: () => void = () => undefined;
+    mocks.refetchActive.mockImplementationOnce(() => {
+      activeOrg.set({ ...activeOrg.get(), isRefetching: true });
+      return new Promise<void>((resolve) => {
+        answer = () => {
+          activeOrg.set({
+            data: { id: "org-2" },
+            error: null,
+            isPending: false,
+            isRefetching: false,
+          });
+          resolve();
+        };
+      });
+    });
     mocks.setActive.mockResolvedValue({ data: { id: "org-2" }, error: null });
     let settled = false;
     const switching = switchOrganization("org-2").then(() => {
       settled = true;
     });
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    // The refresh is under way, not yet answered.
+    await vi.waitFor(() => expect(mocks.refetchActive).toHaveBeenCalled());
     expect(settled).toBe(false);
-    loaded();
+    answer();
     await switching;
     expect(settled).toBe(true);
+  });
+
+  it("waits for the refresh the auth client starts itself, asking for none", async () => {
+    // The org request has the auth client load the active org itself, a
+    // few milliseconds after it answers (as better-auth does).
+    mocks.setActive.mockImplementation(async () => {
+      setTimeout(() => {
+        refreshActive();
+      }, 10);
+      return { data: { id: "org-2" }, error: null };
+    });
+    expect(await switchOrganization("org-2")).toBe(true);
+    // One load of the active org, not two.
+    expect(mocks.refetchActive).not.toHaveBeenCalled();
+    expect(mocks.refresh).toHaveBeenCalledOnce();
+  });
+
+  it("asks again after a blip, and never loads the page afresh", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      mocks.setActive.mockResolvedValue({ data: { id: "org-2" }, error: null });
+      // The first refresh fails (a timeout): the page still shows org-1.
+      mocks.shown = null;
+      mocks.activeError = { status: 504 };
+      const switching = switchOrganization("org-2");
+      // No refresh of the auth client's own comes: one is asked for, and
+      // fails.
+      await vi.advanceTimersByTimeAsync(150);
+      expect(mocks.refetchActive).toHaveBeenCalledOnce();
+      // The next one answers.
+      mocks.shown = "org-2";
+      mocks.activeError = null;
+      await vi.advanceTimersByTimeAsync(600);
+      expect(await switching).toBe(true);
+      expect(mocks.refetchActive).toHaveBeenCalledTimes(2);
+      expect(activeOrg.get().data?.id).toBe("org-2");
+      expect(mocks.resetEditor).toHaveBeenCalledOnce();
+      expect(mocks.refresh).toHaveBeenCalledOnce();
+      // It caught up: nothing to say.
+      expect(mocks.toastError).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("counts a switch the server made as made, though the page could not show it", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      mocks.setActive.mockResolvedValue({ data: { id: "org-2" }, error: null });
+      // Every refresh fails.
+      mocks.shown = null;
+      mocks.activeError = { status: 429 };
+      const switching = switchOrganization("org-2", "/workflows/x");
+      mocks.getAll.mockResolvedValue([
+        { id: "edited", name: "B", updatedAt: "2026-10-02T00:00:00Z" },
+      ]);
+      await vi.advanceTimersByTimeAsync(3000);
+      // Every request now runs as org-2: the switch is made, the editor
+      // reset, and the page moved on in place (no fresh page load).
+      expect(await switching).toBe(true);
+      expect(mocks.refetchActive).toHaveBeenCalledTimes(3);
+      expect(mocks.resetEditor).toHaveBeenCalledOnce();
+      expect(mocks.replace).toHaveBeenCalledWith("/workflows/edited");
+      // The header still names the old org: said, with a reload the user
+      // chooses.
+      expect(mocks.toastError).toHaveBeenCalledWith(
+        "Switched organization, but couldn't update the page.",
+        expect.objectContaining({
+          duration: 12_000,
+          action: expect.objectContaining({ label: "Reload" }),
+        })
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("counts only an error a retry can mend as failing to load", () => {
@@ -241,118 +373,12 @@ describe("switchOrganization", () => {
       expect(failedFor({ status: 404 })).toBe(false);
       expect(failedFor(null)).toBe(false);
       // As the auth client holds it now, for a load that has just answered.
-      mocks.activeError = { status: 503 };
+      activeOrg.set({ ...activeOrg.get(), error: { status: 503 } });
       expect(activeOrgLoadFailed()).toBe(true);
-      mocks.activeError = { status: 400 };
+      activeOrg.set({ ...activeOrg.get(), error: { status: 400 } });
       expect(activeOrgLoadFailed()).toBe(false);
     } finally {
       mocks.activeError = null;
     }
-  });
-
-  it("keeps a fresh load while the page still shows the org it was from", () => {
-    const load = JSON.stringify({ to: "org-9", from: "org-1" });
-    window.sessionStorage.setItem("kh-org-switch-reloaded-for", load);
-    // The page shows org-1 (the hook's active org): the load did not take.
-    act(() => root.render(<Probe key="again" />));
-    expect(window.sessionStorage.getItem("kh-org-switch-reloaded-for")).toBe(
-      load
-    );
-  });
-
-  it("forgets a fresh load once the page shows another org", () => {
-    // Loaded afresh for org-9 from org-5; another tab moved the session on.
-    window.sessionStorage.setItem(
-      "kh-org-switch-reloaded-for",
-      JSON.stringify({ to: "org-9", from: "org-5" })
-    );
-    // The page shows org-1 (the hook's active org).
-    act(() => root.render(<Probe key="again" />));
-    expect(window.sessionStorage.getItem("kh-org-switch-reloaded-for")).toBe(
-      null
-    );
-  });
-
-  describe("when the reload keeps the old org", () => {
-    const location = window.location;
-    const reload = vi.fn();
-    const assign = vi.fn();
-    const replace = vi.fn();
-
-    beforeEach(() => {
-      // The server took the switch; the reload failed and kept what it had.
-      mocks.shown = "org-1";
-      mocks.setActive.mockResolvedValue({ data: { id: "org-2" }, error: null });
-      Object.defineProperty(window, "location", {
-        configurable: true,
-        value: {
-          pathname: location.pathname,
-          reload,
-          assign,
-          replace,
-        },
-      });
-      window.sessionStorage.clear();
-    });
-
-    afterEach(() => {
-      Object.defineProperty(window, "location", {
-        configurable: true,
-        value: location,
-      });
-    });
-
-    it("counts the switch as made and loads the page afresh", async () => {
-      expect(await switchOrganization("org-2")).toBe(true);
-      // The session is the new org's: the page must not stay the old one's.
-      expect(mocks.resetEditor).toHaveBeenCalledOnce();
-      expect(reload).toHaveBeenCalledOnce();
-      expect(mocks.refresh).not.toHaveBeenCalled();
-    });
-
-    it("loads an org's settings page afresh", async () => {
-      expect(await switchOrganization("org-2", "/settings/org-1/billing")).toBe(
-        true
-      );
-      expect(assign).toHaveBeenCalledWith("/settings/org-2/billing");
-      expect(mocks.push).not.toHaveBeenCalled();
-    });
-
-    it("opens the new org's last-edited workflow afresh from a workflow", async () => {
-      mocks.getAll.mockResolvedValue([
-        { id: "edited", name: "B", updatedAt: "2026-10-02T00:00:00Z" },
-      ]);
-      expect(await switchOrganization("org-2", "/workflows/x")).toBe(true);
-      expect(replace).toHaveBeenCalledWith("/workflows/edited");
-      expect(mocks.replace).not.toHaveBeenCalled();
-    });
-
-    it("loads the page the caller is going to, not the one shown", async () => {
-      // Leaving from an org's settings page, on its way to /settings.
-      expect(await switchOrganization("org-2", "/settings")).toBe(true);
-      expect(replace).toHaveBeenCalledWith("/settings");
-      expect(reload).not.toHaveBeenCalled();
-    });
-
-    it("loads afresh again for a fresh load from another org", async () => {
-      // An earlier fresh load for org-2 came from org-9, not the org shown.
-      window.sessionStorage.setItem(
-        "kh-org-switch-reloaded-for",
-        JSON.stringify({ to: "org-2", from: "org-9" })
-      );
-      expect(await switchOrganization("org-2")).toBe(true);
-      expect(reload).toHaveBeenCalledOnce();
-    });
-
-    it("loads afresh once only: a page that still cannot show the org failed", async () => {
-      expect(await switchOrganization("org-2")).toBe(true);
-      expect(reload).toHaveBeenCalledOnce();
-      // The fresh page (a new mount) still shows the old org: its request
-      // keeps failing.
-      act(() => root.render(<Probe key="fresh" />));
-      expect(await switchOrganization("org-2")).toBe(false);
-      expect(reload).toHaveBeenCalledOnce();
-      expect(mocks.resetEditor).toHaveBeenCalledOnce();
-    });
   });
 });

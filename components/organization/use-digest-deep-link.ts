@@ -27,8 +27,8 @@ function dropParam(): void {
  * for the active org and the list to load and for a switch already running,
  * and switches through the switch runner: a failure says so with Try again,
  * and a Try again that works still calls `onReady`. The param stays on the
- * URL until the link is done with (a page loaded afresh for the switch
- * still has it), and the link is let go once its switch has run, or once
+ * URL until the link is done with, and the link is let go once its switch
+ * has run, or once
  * the list failed to load (its Try again follows it again), so it never
  * opens the settings later on its own.
  */

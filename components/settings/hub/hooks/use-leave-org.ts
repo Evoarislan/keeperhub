@@ -59,15 +59,12 @@ export function useLeaveOrg(
   // onto the one that was just removed. Replace rather than push, so back does
   // not return to a page whose organization is gone.
   const afterGone = useCallback(
-    async (done: "Left" | "Deleted"): Promise<void> => {
+    async (done: "Left" | "Deleted", wasActive: boolean): Promise<void> => {
       router.replace("/settings");
       if (organizationId) {
         await switchAwayFrom({
           removed: { id: organizationId, name: organizationName },
-          // The settings page's org is made the active one, but that can
-          // still be on its way, or have failed: as it is now, not as the
-          // page last rendered.
-          wasActive: currentActiveOrgId() === organizationId,
+          wasActive,
           organizations,
           done,
           switchOrganization,
@@ -96,9 +93,13 @@ export function useLeaveOrg(
         return;
       }
       setWorking(true);
+      // As it is before leaving, which clears the active org (and has the
+      // auth client load it again): the settings page's org is made the
+      // active one, but that can still be on its way, or have failed.
+      const wasActive = currentActiveOrgId() === organizationId;
       try {
         await api.organization.leave(organizationId, { newOwnerMemberId });
-        await afterGone("Left");
+        await afterGone("Left", wasActive);
       } catch (error) {
         toast.error(
           error instanceof ApiError
@@ -117,6 +118,9 @@ export function useLeaveOrg(
       return;
     }
     setWorking(true);
+    // As it is before deleting, which clears the active org and has the
+    // auth client load it again, maybe before this reads it.
+    const wasActive = currentActiveOrgId() === organizationId;
     try {
       const { error } = await authClient.organization.delete({
         organizationId,
@@ -125,7 +129,7 @@ export function useLeaveOrg(
         toast.error(error.message || "Could not delete the organization");
         return;
       }
-      await afterGone("Deleted");
+      await afterGone("Deleted", wasActive);
     } catch (error) {
       toast.error(
         error instanceof Error

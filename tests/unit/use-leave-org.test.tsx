@@ -133,6 +133,21 @@ describe("useLeaveOrg", () => {
     expect(mocks.success).toHaveBeenCalledWith("Left Acme");
   });
 
+  it("switches away after a delete that has already cleared the active org", async () => {
+    // The auth client reloads the active org on the delete, maybe before the
+    // hook gets to read it: it reads it before deleting.
+    mocks.deleteOrg.mockImplementation(async () => {
+      mocks.active = null;
+      return { error: null };
+    });
+    mocks.switchOrganization.mockResolvedValue(true);
+    await act(async () => {
+      await state?.remove();
+    });
+    expect(mocks.switchOrganization).toHaveBeenCalledWith("org-2", "/settings");
+    expect(mocks.success).toHaveBeenCalledWith("Deleted Acme. Now in Beta.");
+  });
+
   it("deletes, then says which organization is open", async () => {
     mocks.deleteOrg.mockResolvedValue({ error: null });
     mocks.switchOrganization.mockResolvedValue(true);

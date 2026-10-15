@@ -51,10 +51,7 @@ import {
   useOrganization,
   useOrganizations,
 } from "@/lib/hooks/use-organization";
-import {
-  getOrganizationInitials,
-  getOrganizationLabel,
-} from "@/lib/organization-initials";
+import { getInitials, getOrganizationLabel } from "@/lib/initials";
 import { cn } from "@/lib/utils";
 
 // Px the org list keeps clear of the screen's bottom edge (Radix wants a
@@ -191,7 +188,7 @@ export function OrgSwitcher({
   // Where focus goes in place of this header switcher when it is hidden
   // (below xs): the phone menu's button.
   focusFallback?: React.RefObject<HTMLElement | null>;
-} = {}) {
+} = {}): React.ReactNode {
   const router = useRouter();
   const { data: session } = useSession();
   const {
@@ -215,6 +212,9 @@ export function OrgSwitcher({
   // Once each time no org is active: a switch that keeps failing would
   // otherwise be retried as fast as it fails. A failure offers to try again.
   const autoSwitchTried = useRef(false);
+  // An org was active in this mount: once none is, the list is loaded
+  // afresh before one is opened.
+  const listStaleAfterLoss = useRef(false);
   const busy = useOrgSwitching();
   const offered = useOfferedOrg();
   const inMenu = menu !== undefined;
@@ -289,15 +289,11 @@ export function OrgSwitcher({
   // another itself) or after one has failed (it offers to open one instead).
   useEffect(() => {
     // An org is active: should none be again (removed by an admin, say),
-    // this tries again.
+    // this tries again, from a list loaded afresh, as the one it has may
+    // still hold the org that just went.
     if (organization) {
       autoSwitchTried.current = false;
-    }
-    // Someone else holds the switchers with no org active (leaving or
-    // deleting one): they choose the org, so this does not try. Loading the
-    // active org again is not that: once it finds none, this opens one.
-    if (busy && !organization && !reloading) {
-      autoSwitchTried.current = true;
+      listStaleAfterLoss.current = true;
     }
     const waiting =
       inMenu ||
@@ -314,6 +310,11 @@ export function OrgSwitcher({
       !(waiting || offered || autoSwitchTried.current) &&
       organizations.length > 0
     ) {
+      if (listStaleAfterLoss.current) {
+        listStaleAfterLoss.current = false;
+        reloadList();
+        return;
+      }
       autoSwitchTried.current = true;
       // Quiet, unless it answers a load the user asked for.
       openOrg(organizations[0], takeOpenAnnouncement());
@@ -333,6 +334,7 @@ export function OrgSwitcher({
     offered,
     inMenu,
     openOrg,
+    reloadList,
   ]);
 
   // NAV-05: hide entirely when signed out (session === null) or anonymous.
@@ -465,7 +467,7 @@ export function OrgSwitcher({
     );
   }
 
-  const initials = getOrganizationInitials(organization.name);
+  const initials = getInitials(organization.name);
 
   return (
     // Modal in the menu, whose own scroll lock would otherwise stop a long

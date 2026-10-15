@@ -4,40 +4,42 @@ import { currentActiveOrgId } from "@/lib/hooks/use-organization";
 
 export type OfferedOrg = { id: string; name: string };
 
-// Who is switching the active organization: the org switchers and the links
-// that open an org (one switch at a time; another pick or Try again is
-// ignored), or other code holding the switchers still while it switches
-// (leaving, deleting or creating one). A leave, delete or create can start
-// while a switch runs; the switchers then wait for both.
-let holders = 0;
-// No organization is active and opening this one failed (the first switch,
-// or the switch after leaving or deleting one): both switchers offer it
-// again rather than opening one themselves. Null once one is active.
-let offeredOrg: OfferedOrg | null = null;
-// The org a running switch asked for from a control that goes away (a
-// toast's Try again, the switcher's state button) is opening: focus goes to
-// the switcher once it shows that org. Set before the switch starts, as the
-// org can show before the switch is done (on a workflow page it then finds
-// the workflow to open); cleared when the switch fails.
-let focusAfterOrgId: string | null = null;
+// The switch state the switchers and the other switches share, in one
+// place. The active org itself is never copied here: it is read from the
+// auth client (currentActiveOrgId), so it is right with no switcher mounted.
+const state = {
+  // Who is switching the active organization: the org switchers and the
+  // links that open an org (one switch at a time; another pick or Try again
+  // is ignored), or other code holding the switchers still while it
+  // switches (leaving, deleting or creating one). A leave, delete or create
+  // can start while a switch runs; the switchers then wait for both.
+  holders: 0,
+  // No organization is active and opening this one failed (the first
+  // switch, or the switch after leaving or deleting one): both switchers
+  // offer it again rather than opening one themselves. Null once one is
+  // active.
+  offeredOrg: null as OfferedOrg | null,
+  // The org a running switch asked for from a control that goes away (a
+  // toast's Try again, the switcher's state button) is opening: focus goes
+  // to the switcher once it shows that org. Set before the switch starts,
+  // as the org can show before the switch is done (on a workflow page it
+  // then finds the workflow to open); cleared when the switch fails.
+  focusAfterOrgId: null as string | null,
+  // The active org is being loaded again after it could not be.
+  reloadingOrg: false,
+  // A load the user asked for found no org active (it is gone): the org the
+  // switchers then open is announced, as nothing else answers the load.
+  announceNextOpen: false,
+  // The header's switcher offers to try again (to open an org, or load the
+  // active one): where it is otherwise hidden, it shows.
+  switcherOffering: false,
+  // The toast the last switch left; the next switch clears it.
+  lastSwitchToast: undefined as string | number | undefined,
+};
 // For a load of the active org asked for from the switcher: whichever org
 // shows takes the focus request.
 const ANY_ORG = "*";
-// The active org is being loaded again after it could not be.
-let reloadingOrg = false;
-// A load the user asked for found no org active (it is gone): the org the
-// switchers then open is announced, as nothing else answers the load.
-let announceNextOpen = false;
-// The header's switcher offers to try again (to open an org, or load the
-// active one): where it is otherwise hidden, it shows.
-let switcherOffering = false;
 const listeners = new Set<() => void>();
-// The toast the last switch left; the next switch clears it.
-let lastSwitchToast: string | number | undefined;
-// The active org as the switchers last saw it, so no switch (a Try again
-// among them) switches to an org that is already active (one the server
-// took though its answer was lost, or one opened another way meanwhile).
-let activeOrgId: string | null = null;
 
 function notify(): void {
   for (const listener of listeners) {
@@ -53,25 +55,25 @@ function subscribe(onChange: () => void): () => void {
 }
 
 function getSwitching(): boolean {
-  return holders > 0;
+  return state.holders > 0;
 }
 
 function getOfferedOrg(): OfferedOrg | null {
-  return offeredOrg;
+  return state.offeredOrg;
 }
 
 function getReloadingOrg(): boolean {
-  return reloadingOrg;
+  return state.reloadingOrg;
 }
 
 function getSwitcherOffering(): boolean {
-  return switcherOffering;
+  return state.switcherOffering;
 }
 
 /** The header's switcher's note of whether it offers to try again. */
 export function noteSwitcherOffering(offering: boolean): void {
-  if (switcherOffering !== offering) {
-    switcherOffering = offering;
+  if (state.switcherOffering !== offering) {
+    state.switcherOffering = offering;
     notify();
   }
 }
@@ -89,12 +91,12 @@ export function useSwitcherOffering(): boolean {
 }
 
 function hold(): void {
-  holders += 1;
+  state.holders += 1;
   notify();
 }
 
 function release(): void {
-  holders -= 1;
+  state.holders -= 1;
   notify();
 }
 
@@ -114,17 +116,16 @@ export function useOfferedOrg(): OfferedOrg | null {
 }
 
 function setOfferedOrg(org: OfferedOrg | null): void {
-  offeredOrg = org;
+  state.offeredOrg = org;
   notify();
 }
 
-/** The switchers' note of the active org; one being active ends an offer. */
+/** The switchers' note that an org shows; one being active ends an offer. */
 export function noteActiveOrg(orgId: string | null): void {
-  activeOrgId = orgId;
   if (orgId !== null) {
-    announceNextOpen = false;
+    state.announceNextOpen = false;
   }
-  if (orgId !== null && offeredOrg !== null) {
+  if (orgId !== null && state.offeredOrg !== null) {
     setOfferedOrg(null);
   }
 }
@@ -134,8 +135,8 @@ export function noteActiveOrg(orgId: string | null): void {
  * to be announced: once, after a load the user asked for found none.
  */
 export function takeOpenAnnouncement(): boolean {
-  const announce = announceNextOpen;
-  announceNextOpen = false;
+  const announce = state.announceNextOpen;
+  state.announceNextOpen = false;
   return announce;
 }
 
@@ -149,15 +150,15 @@ const NO_ORG_MESSAGE = "You're no longer in any organization.";
  * said, as nothing else answers the load.
  */
 export function settleOpenAnnouncement(noOrgs: boolean): void {
-  if (!announceNextOpen) {
+  if (!state.announceNextOpen) {
     return;
   }
-  announceNextOpen = false;
+  state.announceNextOpen = false;
   if (noOrgs) {
-    if (lastSwitchToast !== undefined) {
-      toast.dismiss(lastSwitchToast);
+    if (state.lastSwitchToast !== undefined) {
+      toast.dismiss(state.lastSwitchToast);
     }
-    lastSwitchToast = toast.info(NO_ORG_MESSAGE, { duration: 12_000 });
+    state.lastSwitchToast = toast.info(NO_ORG_MESSAGE, { duration: 12_000 });
   }
 }
 
@@ -166,8 +167,9 @@ export function settleOpenAnnouncement(noOrgs: boolean): void {
  * other org showing ends the request, so it never moves focus later.
  */
 export function takeSwitcherFocus(orgId: string): boolean {
-  const asked = focusAfterOrgId === orgId || focusAfterOrgId === ANY_ORG;
-  focusAfterOrgId = null;
+  const asked =
+    state.focusAfterOrgId === orgId || state.focusAfterOrgId === ANY_ORG;
+  state.focusAfterOrgId = null;
   return asked;
 }
 
@@ -220,11 +222,11 @@ function showFailure(
   request: SwitchRequest,
   id?: string | number
 ): void {
-  if (id === undefined && lastSwitchToast !== undefined) {
-    toast.dismiss(lastSwitchToast);
+  if (id === undefined && state.lastSwitchToast !== undefined) {
+    toast.dismiss(state.lastSwitchToast);
   }
   // Long enough to reach its Try again with a screen reader.
-  lastSwitchToast = toast.error(message, {
+  state.lastSwitchToast = toast.error(message, {
     id,
     duration: 12_000,
     action: {
@@ -246,18 +248,20 @@ function showFailure(
  */
 export function runOrgSwitch(request: SwitchRequest): Promise<boolean | null> {
   const { orgId, name, start, announce, kind = "switch", refocus } = request;
-  if (holders > 0 || orgId === activeOrgId) {
+  // Not for an org already active (one the server took though its answer
+  // was lost, or one opened another way meanwhile).
+  if (state.holders > 0 || orgId === currentActiveOrgId()) {
     return Promise.resolve(null);
   }
   hold();
-  if (lastSwitchToast !== undefined) {
-    toast.dismiss(lastSwitchToast);
-    lastSwitchToast = undefined;
+  if (state.lastSwitchToast !== undefined) {
+    toast.dismiss(state.lastSwitchToast);
+    state.lastSwitchToast = undefined;
   }
   const say = WORDING[kind];
   const id = announce ? toast.loading(say.loading(name)) : undefined;
   if (refocus) {
-    focusAfterOrgId = orgId;
+    state.focusAfterOrgId = orgId;
   }
   // Through a promise, so a start that throws still lets the lock go.
   return Promise.resolve()
@@ -268,18 +272,18 @@ export function runOrgSwitch(request: SwitchRequest): Promise<boolean | null> {
     })
     .then((switched) => {
       if (switched) {
-        if (offeredOrg !== null) {
+        if (state.offeredOrg !== null) {
           setOfferedOrg(null);
         }
         release();
         if (id !== undefined) {
-          lastSwitchToast = toast.success(say.success(name), { id });
+          state.lastSwitchToast = toast.success(say.success(name), { id });
         }
         request.onSwitched?.();
         return true;
       }
-      if (focusAfterOrgId === orgId) {
-        focusAfterOrgId = null;
+      if (state.focusAfterOrgId === orgId) {
+        state.focusAfterOrgId = null;
       }
       // Before the switchers are let go, so none opens an org itself.
       if (kind === "open") {
@@ -327,18 +331,18 @@ export function runOrgLoad(
   refocus: boolean,
   reloadList: () => Promise<boolean>
 ): Promise<boolean | null> {
-  if (holders > 0) {
+  if (state.holders > 0) {
     return Promise.resolve(null);
   }
-  reloadingOrg = true;
+  state.reloadingOrg = true;
   hold();
-  if (lastSwitchToast !== undefined) {
-    toast.dismiss(lastSwitchToast);
-    lastSwitchToast = undefined;
+  if (state.lastSwitchToast !== undefined) {
+    toast.dismiss(state.lastSwitchToast);
+    state.lastSwitchToast = undefined;
   }
   const id = toast.loading("Loading your organization...");
   if (refocus) {
-    focusAfterOrgId = ANY_ORG;
+    state.focusAfterOrgId = ANY_ORG;
   }
   return Promise.resolve()
     .then(load)
@@ -347,20 +351,22 @@ export function runOrgLoad(
       return { org: false, list: false };
     })
     .then(({ org, list }) => {
-      reloadingOrg = false;
+      state.reloadingOrg = false;
       // None active after all (it is gone): the switchers open one,
       // announced in place of this, and the focus request stands for it, as
       // the button that had focus is gone. Noted before they are let go.
       const noneActive = org && list && currentActiveOrgId() === undefined;
       if (noneActive) {
-        announceNextOpen = true;
+        state.announceNextOpen = true;
       }
       release();
       if (org && list) {
         if (noneActive) {
           toast.dismiss(id);
         } else {
-          lastSwitchToast = toast.success("Loaded your organization", { id });
+          state.lastSwitchToast = toast.success("Loaded your organization", {
+            id,
+          });
         }
         return true;
       }
@@ -368,14 +374,14 @@ export function runOrgLoad(
         // The active org loaded (and shows, if there is one); only the list
         // did not: said as a link's is, with a Try again that loads it.
         toast.dismiss(id);
-        lastSwitchToast = undefined;
+        state.lastSwitchToast = undefined;
         reportLinkProblem("listFailed", reloadList);
         return false;
       }
-      if (focusAfterOrgId === ANY_ORG) {
-        focusAfterOrgId = null;
+      if (state.focusAfterOrgId === ANY_ORG) {
+        state.focusAfterOrgId = null;
       }
-      lastSwitchToast = toast.error("Couldn't load your organization.", {
+      state.lastSwitchToast = toast.error("Couldn't load your organization.", {
         id,
         duration: 12_000,
         action: {
@@ -410,10 +416,10 @@ export function reportLinkProblem(
   problem: keyof typeof LINK_PROBLEM,
   reload?: () => Promise<boolean>
 ): void {
-  if (lastSwitchToast !== undefined) {
-    toast.dismiss(lastSwitchToast);
+  if (state.lastSwitchToast !== undefined) {
+    toast.dismiss(state.lastSwitchToast);
   }
-  lastSwitchToast = toast.error(LINK_PROBLEM[problem], {
+  state.lastSwitchToast = toast.error(LINK_PROBLEM[problem], {
     duration: 12_000,
     action: reload
       ? {
@@ -427,18 +433,18 @@ export function reportLinkProblem(
 }
 
 function reloadForLink(reload: () => Promise<boolean>): void {
-  if (lastSwitchToast !== undefined) {
-    toast.dismiss(lastSwitchToast);
+  if (state.lastSwitchToast !== undefined) {
+    toast.dismiss(state.lastSwitchToast);
   }
   const id = toast.loading("Loading your organizations...");
-  lastSwitchToast = id;
+  state.lastSwitchToast = id;
   reload()
     .catch(() => false)
     .then((loaded) => {
       if (loaded) {
         toast.dismiss(id);
-        if (lastSwitchToast === id) {
-          lastSwitchToast = undefined;
+        if (state.lastSwitchToast === id) {
+          state.lastSwitchToast = undefined;
         }
         return;
       }
@@ -451,13 +457,12 @@ function reloadForLink(reload: () => Promise<boolean>): void {
  * fresh copy of it would also load a second React.
  */
 export function resetOrgSwitchState(): void {
-  holders = 0;
-  offeredOrg = null;
-  focusAfterOrgId = null;
-  reloadingOrg = false;
-  announceNextOpen = false;
-  switcherOffering = false;
-  lastSwitchToast = undefined;
-  activeOrgId = null;
+  state.holders = 0;
+  state.offeredOrg = null;
+  state.focusAfterOrgId = null;
+  state.reloadingOrg = false;
+  state.announceNextOpen = false;
+  state.switcherOffering = false;
+  state.lastSwitchToast = undefined;
   notify();
 }

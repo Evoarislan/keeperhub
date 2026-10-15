@@ -228,7 +228,7 @@ describe("the digest link", () => {
       })
     );
     await render();
-    // A page loaded afresh for the switch still follows the link.
+    // Until the switch is done, the link is still on the URL.
     expect(urlHasParam()).toBe(true);
     await act(async () => {
       answer(true);

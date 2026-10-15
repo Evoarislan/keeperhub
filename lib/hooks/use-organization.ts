@@ -3,6 +3,7 @@
 import { useSetAtom } from "jotai";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect } from "react";
+import { toast } from "sonner";
 import { invalidateFeatureSnapshot } from "@/hooks/use-features";
 import { api } from "@/lib/api-client";
 import { analyticsProjectIdAtom } from "@/lib/atoms/analytics";
@@ -13,35 +14,73 @@ import { refetchSidebar } from "@/lib/refetch-sidebar";
 import { latestVisibleWorkflow } from "@/lib/workflow/latest-workflow";
 import { resetWorkflowStateForOrgSwitchAtom } from "@/lib/workflow/store";
 
-// A fresh page load a switch asked for, as the server had switched (`to`)
-// but the page still showed the org it was in (`from`). Kept in the tab
-// until the page shows `to`, or an org other than `from` (another tab has
-// moved the session on): a page that still shows `from` reports the switch
-// as failed rather than loading again, so nothing loads again and again.
-const RELOADED_FOR_KEY = "kh-org-switch-reloaded-for";
+type ActiveOrgState = {
+  data: { id: string } | null;
+  isPending: boolean;
+  isRefetching: boolean;
+};
 
-type FreshLoad = { to: string; from: string | null };
+// How often a switch asks for the active org again when its refresh did not
+// show the new one (a blip: a timeout, too many requests), and how long it
+// waits before each.
+const SHOW_RETRY_DELAYS_MS = [500, 1500];
 
-function freshLoad(): FreshLoad | null {
-  try {
-    const stored = window.sessionStorage.getItem(RELOADED_FOR_KEY);
-    return stored ? (JSON.parse(stored) as FreshLoad) : null;
-  } catch {
-    return null;
-  }
-}
+// Said when the server switched but the page could not show the new org.
+const PAGE_BEHIND_MESSAGE =
+  "Switched organization, but couldn't update the page.";
 
-function noteFreshLoad(load: FreshLoad | null): void {
-  try {
-    if (load === null) {
-      window.sessionStorage.removeItem(RELOADED_FOR_KEY);
-    } else {
-      window.sessionStorage.setItem(RELOADED_FOR_KEY, JSON.stringify(load));
-    }
-  } catch {
-    // No storage (a sandboxed frame): a page that cannot show the org may
-    // then load afresh again, as each switch is asked for.
-  }
+// The auth client starts its own refresh of the active org a few
+// milliseconds after an organization request answers (setActive among
+// them); a switch waits this long for it before asking for one itself.
+const OWN_REFRESH_GRACE_MS = 100;
+// However a refresh goes, one wait for it lasts no longer than this.
+const SHOW_WAIT_LIMIT_MS = 10_000;
+
+/**
+ * Resolves once the auth client's active org is `orgId` (true), or once a
+ * refresh has answered without it (false). Waits `askAfterMs` for a refresh
+ * the auth client starts itself before asking for one, so a switch does
+ * not load the active org twice; asks at once where nothing else will.
+ */
+function whenActiveOrgShows(
+  orgId: string,
+  refetch: () => Promise<unknown>,
+  askAfterMs: number
+): Promise<boolean> {
+  const atom = authClient.$store.atoms.activeOrganization;
+  return new Promise((resolve) => {
+    let started = false;
+    let settled = false;
+    let unlisten: () => void = () => undefined;
+    let limit: ReturnType<typeof setTimeout> | undefined;
+    const finish = (shown: boolean): void => {
+      if (!settled) {
+        settled = true;
+        unlisten();
+        clearTimeout(limit);
+        resolve(shown);
+      }
+    };
+    const check = (state: ActiveOrgState): void => {
+      if (state.isPending || state.isRefetching) {
+        started = true;
+      } else if (state.data?.id === orgId) {
+        finish(true);
+      } else if (started) {
+        finish(false);
+      }
+    };
+    unlisten = atom.listen(check);
+    check(atom.get());
+    // None under way by then (or the auth client's has been and gone):
+    // ask for one.
+    setTimeout(() => {
+      if (!(settled || started)) {
+        refetch();
+      }
+    }, askAfterMs);
+    limit = setTimeout(() => finish(false), SHOW_WAIT_LIMIT_MS);
+  });
 }
 
 /** The active org's id as the auth client holds it now, not as last rendered. */
@@ -85,19 +124,6 @@ export function useOrganization() {
     resetWorkflowStateForOrgSwitchAtom
   );
 
-  // The page shows an org: a fresh load asked for earlier is over, whether
-  // it showed that org or another tab has moved the session on since.
-  useEffect(() => {
-    const load = freshLoad();
-    if (
-      activeOrg?.id &&
-      load !== null &&
-      (activeOrg.id === load.to || activeOrg.id !== load.from)
-    ) {
-      noteFreshLoad(null);
-    }
-  }, [activeOrg?.id]);
-
   // Register this hook's refetch callback so it can be triggered externally
   useEffect(
     () =>
@@ -120,28 +146,34 @@ export function useOrganization() {
       if (switchError) {
         return false;
       }
-      // Resolves once the new org is the one shown (or the page is loading
-      // afresh to show it), so callers (and the switchers waiting on them)
-      // never act on a page with no org active.
-      await refetch();
-      // The server has switched, so every request now runs as the new org.
-      // Should the reload have failed and kept the old one, the page is loaded
-      // afresh rather than left showing it; once only, so a page that still
-      // shows the old org never loads again and again: then the switch
-      // failed.
-      const shown = currentActiveOrgId() ?? null;
-      const stale = shown !== orgId;
-      if (stale) {
-        const load = freshLoad();
-        if (load?.to === orgId && load.from === shown) {
-          return false;
+      // Resolves once the new org is the one shown, so callers (and the
+      // switchers waiting on them) never act on a page with no org active.
+      // A refresh that did not show it (a blip) is asked for again, a
+      // little later. The server has switched either way, and every request
+      // now runs as the new org, so the switch is made; should the page
+      // still not show it, that is said, with a reload to bring it up to
+      // date, as the header would otherwise name the org the user left.
+      // First the refresh the auth client starts itself after setActive.
+      let shown = await whenActiveOrgShows(
+        orgId,
+        refetch,
+        OWN_REFRESH_GRACE_MS
+      );
+      for (const delay of SHOW_RETRY_DELAYS_MS) {
+        if (shown) {
+          break;
         }
-        noteFreshLoad({ to: orgId, from: shown });
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        shown = await whenActiveOrgShows(orgId, refetch, 0);
+      }
+      if (!shown) {
+        toast.error(PAGE_BEHIND_MESSAGE, {
+          duration: 12_000,
+          action: { label: "Reload", onClick: () => window.location.reload() },
+        });
       }
       const open = (href: string, replace: boolean): void => {
-        if (stale) {
-          window.location[replace ? "replace" : "assign"](href);
-        } else if (replace) {
+        if (replace) {
           router.replace(href);
         } else {
           router.push(href);
@@ -151,14 +183,7 @@ export function useOrganization() {
       // changed.
       const pathname = fromPath ?? window.location.pathname;
       const reload = (): void => {
-        if (!stale) {
-          router.refresh();
-        } else if (fromPath) {
-          // The caller is already leaving the page shown, for this one.
-          window.location.replace(fromPath);
-        } else {
-          window.location.reload();
-        }
+        router.refresh();
       };
       // Reset workflow state only after the switch took (safe in hook context).
       resetWorkflowStateForOrgSwitch();

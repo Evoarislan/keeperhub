@@ -24,16 +24,33 @@ function upper(character: string): string {
 }
 
 /**
- * The organization switcher's label on narrow screens: the first character
- * of the name's first two words ("Acme Labs" -> "AL", "Personal" -> "P").
+ * A name's initials, wherever the app shows them (an organization, a user,
+ * an actor): the first character of its first two words ("Acme Labs" ->
+ * "AL", "Personal" -> "P"), "?" when there is none.
  */
-export function getOrganizationInitials(name: string): string {
+export function getInitials(name: string): string {
   const words = name.trim().split(WHITESPACE).filter(Boolean);
   const initials = words
     .slice(0, 2)
     .map((word) => upper(firstCharacter(word)))
     .join("");
   return initials || "?";
+}
+
+/**
+ * A person's initials, wherever the app shows them (the user menu, an
+ * activity's actor): their name's, else the first character of their
+ * email, "?" with neither.
+ */
+export function getPersonInitials(
+  person: { name?: string | null; email?: string | null } | null | undefined
+): string {
+  const name = person?.name?.trim();
+  if (name) {
+    return getInitials(name);
+  }
+  const email = person?.email?.trim();
+  return email ? upper(firstCharacter(email)) : "?";
 }
 
 /**
@@ -44,7 +61,7 @@ export function getOrganizationInitials(name: string): string {
  */
 export function getOrganizationLabel(name: string): string {
   const trimmed = name.trim();
-  const initials = getOrganizationInitials(trimmed);
+  const initials = getInitials(trimmed);
   const words = trimmed.split(WHITESPACE).filter(Boolean);
   if (words.length <= 1) {
     return trimmed || initials;

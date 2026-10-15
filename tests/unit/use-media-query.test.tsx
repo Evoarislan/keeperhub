@@ -48,9 +48,16 @@ beforeEach(() => {
   matches = true;
   listeners = new Set();
   seen = [];
+  // As a real MediaQueryList: `matches` follows the screen.
   vi.stubGlobal(
     "matchMedia",
-    vi.fn(() => ({ matches, addEventListener, removeEventListener }))
+    vi.fn(() => ({
+      get matches(): boolean {
+        return matches;
+      },
+      addEventListener,
+      removeEventListener,
+    }))
   );
   container = document.createElement("div");
   document.body.appendChild(container);
@@ -75,6 +82,14 @@ describe("useMediaQuery", () => {
     expect(seen.at(-1)).toBe(false);
     change(true);
     expect(seen.at(-1)).toBe(true);
+  });
+
+  it("builds one list per query, however often it renders", () => {
+    render();
+    render();
+    change(false);
+    render();
+    expect(window.matchMedia).toHaveBeenCalledOnce();
   });
 
   it("subscribes once, however often it renders", () => {

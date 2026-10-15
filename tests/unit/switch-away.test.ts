@@ -6,6 +6,12 @@ const mocks = vi.hoisted(() => ({
   loading: vi.fn(() => "toast-loading"),
   refetchOrganizations: vi.fn(),
   dismiss: vi.fn(),
+  // The active org as the auth client holds it.
+  activeOrgId: undefined as string | undefined,
+}));
+
+vi.mock("@/lib/hooks/use-organization", () => ({
+  currentActiveOrgId: () => mocks.activeOrgId,
 }));
 
 vi.mock("@/lib/refetch-organizations", () => ({
@@ -37,6 +43,7 @@ const BETA = { id: "org-2", name: "Beta" };
 beforeEach(() => {
   vi.clearAllMocks();
   resetOrgSwitchState();
+  mocks.activeOrgId = undefined;
 });
 
 function run(switchOrganization: (orgId: string) => Promise<boolean>) {
@@ -218,7 +225,7 @@ describe("switchAwayFrom", () => {
       switchOrganization,
     });
     // Opened another way meanwhile (the switcher's Open organization).
-    noteActiveOrg("org-2");
+    mocks.activeOrgId = "org-2";
     const options = mocks.error.mock.calls[0]?.[1] as {
       action: { onClick: () => void };
     };

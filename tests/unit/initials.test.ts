@@ -1,42 +1,43 @@
 import { describe, expect, it } from "vitest";
 import {
-  getOrganizationInitials,
+  getInitials,
   getOrganizationLabel,
-} from "@/lib/organization-initials";
+  getPersonInitials,
+} from "@/lib/initials";
 
-describe("getOrganizationInitials", () => {
+describe("getInitials", () => {
   it("takes the first letter of the first two words", () => {
-    expect(getOrganizationInitials("Acme Labs")).toBe("AL");
-    expect(getOrganizationInitials("Sandbox for TechOps")).toBe("SF");
+    expect(getInitials("Acme Labs")).toBe("AL");
+    expect(getInitials("Sandbox for TechOps")).toBe("SF");
   });
 
   it("uses one letter for a one-word name", () => {
-    expect(getOrganizationInitials("Personal")).toBe("P");
+    expect(getInitials("Personal")).toBe("P");
   });
 
   it("upper-cases and ignores extra spaces", () => {
-    expect(getOrganizationInitials("  defi   ops ")).toBe("DO");
+    expect(getInitials("  defi   ops ")).toBe("DO");
   });
 
   it("keeps a character made of two code units whole", () => {
-    expect(getOrganizationInitials("𝔸cme labs")).toBe("𝔸L");
+    expect(getInitials("𝔸cme labs")).toBe("𝔸L");
   });
 
   it("keeps a flag or an emoji sequence whole", () => {
-    expect(getOrganizationInitials("🇺🇸 Team")).toBe("🇺🇸T");
-    expect(getOrganizationInitials("👩‍💻 Devs")).toBe("👩‍💻D");
+    expect(getInitials("🇺🇸 Team")).toBe("🇺🇸T");
+    expect(getInitials("👩‍💻 Devs")).toBe("👩‍💻D");
   });
 
   it("keeps an accent typed as a separate mark on its letter", () => {
-    expect(getOrganizationInitials("e\u0301cole Labs")).toBe("E\u0301L");
+    expect(getInitials("e\u0301cole Labs")).toBe("E\u0301L");
   });
 
   it("leaves a letter whose upper case is two letters as it is", () => {
-    expect(getOrganizationInitials("ßeta Labs")).toBe("ßL");
+    expect(getInitials("ßeta Labs")).toBe("ßL");
   });
 
   it("falls back to a question mark for an empty name", () => {
-    expect(getOrganizationInitials("   ")).toBe("?");
+    expect(getInitials("   ")).toBe("?");
   });
 });
 
@@ -63,5 +64,23 @@ describe("getOrganizationLabel", () => {
 
   it("falls back to the initials' question mark for an empty name", () => {
     expect(getOrganizationLabel("   ")).toBe("?");
+  });
+});
+
+describe("getPersonInitials", () => {
+  it("uses the name's initials, as everywhere else", () => {
+    expect(getPersonInitials({ name: "Mary Jane Smith" })).toBe("MJ");
+  });
+
+  it("falls back to the email's first character", () => {
+    expect(getPersonInitials({ name: "  ", email: "jo@example.com" })).toBe(
+      "J"
+    );
+    expect(getPersonInitials({ email: "jo@example.com" })).toBe("J");
+  });
+
+  it("is a question mark with neither", () => {
+    expect(getPersonInitials(null)).toBe("?");
+    expect(getPersonInitials({ name: null, email: "" })).toBe("?");
   });
 });

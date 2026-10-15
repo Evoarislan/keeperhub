@@ -188,25 +188,30 @@ select inside the panel closes only that.
 - One switch at a time (`org-switch-runner.ts`): while one runs, from a
   switcher or a leave or delete, both switchers show a spinner, are marked
   busy (dimmed) and keep their list shut; they stay focusable, so focus
-  returns to them after a pick. A switch counts as done once the new
-  organization is shown; if the server switched but the reload still shows
-  the old one, the page is loaded afresh (to the page the caller is going
-  to), once per organization: if it still cannot show it, the switch
-  failed. The settings page's switch to the organization in its URL, and
-  the digest email's link, run the same way, once the active organization,
-  the list and any running switch are done (a switch that takes the lock
-  first is waited for). A link for an organization the user is not in says
-  so ("You're not a member of that organization.", 12s; the settings page
-  then goes to `/settings`); a list that failed to load says that instead
+  returns to them after a pick. A switch waits for the new organization to
+  show, through the refresh of the active organization the auth client starts
+  itself (waiting briefly for it, so no second request). A refresh that did
+  not show it (a timeout, rate limiting) is asked for again, twice, a little
+  later. The server has switched either way, so the switch is made, and the
+  page is never loaded afresh on its own: should it still show the old
+  organization, it says "Switched organization, but couldn't update the page."
+  (12s) with Reload. After the active organization goes away, the list is
+  loaded afresh before the switcher opens another, so it does not reopen the
+  one that went. The settings page's switch to the organization in its URL,
+  and the digest email's link, run the same way, once the active organization,
+  the list and any running switch are done (a switch that takes the lock first
+  is waited for). A link for an organization the user is not in says so
+  ("You're not a member of that organization.", 12s; the settings page then
+  goes to `/settings`); a list that failed to load says that instead
   ("Couldn't load your organizations.", once, with Try again, which says
   "Loading your organizations..." and says it again should the list fail
-  again). The settings page waits for the list; the digest link is let go,
-  and its Try again follows it again once the list loads, so a list loaded
-  later some other way never switches on its own. The digest link opens its
-  settings once its switch is made, after a Try again too, keeps its param
-  until it is done with, and is let go after its switch has run. Creating
-  an organization, which makes it the active one, runs under the lock.
-  The next switch clears the last one's toast.
+  again). The settings page waits for the list; the digest link is let go, and
+  its Try again follows it again once the list loads, so a list loaded later
+  some other way never switches on its own. The digest link opens its settings
+  once its switch is made, after a Try again too, keeps its param until it is
+  done with, and is let go after its switch has run. Creating an organization,
+  which makes it the active one, runs under the lock. The next switch clears
+  the last one's toast.
 - At any width, picking the organization in use only closes the list (and
   the drawer): switching to it again would clear the workflow editor.
 - A failed switch changes nothing. A switch from a workflow opens the new
