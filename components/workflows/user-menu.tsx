@@ -229,7 +229,9 @@ const AuthenticatedUserMenu = (): React.ReactElement => {
             </Tooltip>
           </DropdownMenuLabel>
           <DropdownMenuSeparator />
-          <div className="lg:hidden">
+          {/* A 768-1023px window with a mouse has no org switcher in the
+              header (phones and touch tablets do), so this stays there. */}
+          <div className="hidden mouse-tablet:block">
             <DropdownMenuItem
               onClick={() =>
                 router.push(
